@@ -32,6 +32,14 @@ pub const MemoryContext = struct {
 
     /// Save a memory to L1. The agent calls this when it decides something
     /// is worth remembering. No extraction LLM — the agent IS the extractor.
+    ///
+    /// The `session_id` is derived from `self.iso.session_id`. If the
+    /// isolation context has no session_id, `"default"` is used.
+    ///
+    /// **Contract**: `store.upsertL1` MUST deep-copy all string fields in
+    /// the `L1Record` (the SqliteStore does this via `sqlite3_bind_text`
+    /// with `SQLITE_TRANSIENT`). The record's string fields are freed
+    /// before this function returns; the store must not retain pointers.
     pub fn save(
         self: *MemoryContext,
         allocator: std.mem.Allocator,
@@ -39,13 +47,26 @@ pub const MemoryContext = struct {
         mem_type: types.MemoryType,
         priority: f32,
         scene_name: []const u8,
-        session_id: []const u8,
     ) !bool {
-        const now_iso = try nowIso(allocator);
-        defer allocator.free(now_iso);
+        const sid = self.iso.session_id orelse "default";
 
+        // Allocate each string field separately so the store can copy them
+        // independently. A single shared buffer would be freed before the
+        // store finishes if it retained pointers.
         const record_id = try generateId(allocator);
         defer allocator.free(record_id);
+
+        const ts_str = try nowMillisStr(allocator);
+        defer allocator.free(ts_str);
+
+        const ts_start = try allocator.dupe(u8, ts_str);
+        defer allocator.free(ts_start);
+        const ts_end = try allocator.dupe(u8, ts_str);
+        defer allocator.free(ts_end);
+        const created = try allocator.dupe(u8, ts_str);
+        defer allocator.free(created);
+        const updated = try allocator.dupe(u8, ts_str);
+        defer allocator.free(updated);
 
         const record = types.L1Record{
             .record_id = record_id,
@@ -53,18 +74,18 @@ pub const MemoryContext = struct {
             .type = mem_type,
             .priority = priority,
             .scene_name = scene_name,
-            .session_key = session_id,
-            .session_id = session_id,
+            .session_key = sid,
+            .session_id = sid,
             .team_id = self.iso.team_id,
             .task_id = self.iso.task_id orelse "",
             .user_id = self.iso.user_id,
             .agent_id = self.iso.agent_id,
             .version = 1,
-            .timestamp_str = now_iso,
-            .timestamp_start = now_iso,
-            .timestamp_end = now_iso,
-            .created_time = now_iso,
-            .updated_time = now_iso,
+            .timestamp_str = ts_str,
+            .timestamp_start = ts_start,
+            .timestamp_end = ts_end,
+            .created_time = created,
+            .updated_time = updated,
             .metadata_json = "{}",
         };
 
@@ -186,12 +207,13 @@ var id_counter: std.atomic.Value(u64) = .init(0);
 
 fn generateId(allocator: std.mem.Allocator) ![]u8 {
     const c = id_counter.fetchAdd(1, .monotonic);
-    return std.fmt.allocPrint(allocator, "mem-{d}-{d}", .{ nowMillis(), c });
+    const ms = try nowMillis();
+    return std.fmt.allocPrint(allocator, "mem-{d}-{d}", .{ ms, c });
 }
 
 /// Current time as a millisecond timestamp (epoch).
-/// Uses clock_gettime on Linux, falls back to 0 on other platforms.
-fn nowMillis() i64 {
+/// Returns an error if the system clock is unavailable.
+fn nowMillis() !i64 {
     const builtin = @import("builtin");
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
@@ -199,7 +221,7 @@ fn nowMillis() i64 {
         if (linux.clock_gettime(.REALTIME, &ts) == 0) {
             return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
         }
-        return 0;
+        return error.ClockUnavailable;
     }
     if (builtin.link_libc) {
         var ts: std.c.timespec = undefined;
@@ -207,12 +229,14 @@ fn nowMillis() i64 {
             return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
         }
     }
-    return 0;
+    return error.ClockUnavailable;
 }
 
-/// Current time as ISO 8601-style string (millisecond timestamp as string).
-fn nowIso(allocator: std.mem.Allocator) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{d}", .{nowMillis()});
+/// Current time as a millisecond epoch string (NOT ISO 8601).
+/// Used for timestamp fields in L1Record. Returns an owned string.
+fn nowMillisStr(allocator: std.mem.Allocator) ![]u8 {
+    const ms = try nowMillis();
+    return std.fmt.allocPrint(allocator, "{d}", .{ms});
 }
 
 // ============================
@@ -270,7 +294,7 @@ test "MemoryContext save + search round-trip" {
     };
 
     // Save a memory.
-    _ = try mem_ctx.save(allocator, "User prefers PostgreSQL over MySQL", .persona, 80, "database preferences", "test-session");
+    _ = try mem_ctx.save(allocator, "User prefers PostgreSQL over MySQL", .persona, 80, "database preferences");
 
     // Search for it.
     const results = try mem_ctx.search(allocator, "PostgreSQL", 5);
