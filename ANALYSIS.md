@@ -1644,3 +1644,394 @@ zig build test-all     # Run all tests
 | `test/sqlite_store_test.zig` | 465 | Integration tests (12 tests) |
 | `build.zig` | 80 | Build config + test targets |
 | **Total** | **~2457** | |
+
+---
+
+## 10. Revised Phase 2 Design — Tool + Guardrail Hook (Not LLM Registry)
+
+_Updated after Phase 1 PR merge and architecture discussion._
+
+### 10.1 The Problem with "Calling Franky's LLM Registry"
+
+The original Phase 2 plan (§4.5, §6.6) proposed that `franky-memory`'s extraction pipeline would call franky's `ai.registry.Registry` directly to distill L0 → L1. This means:
+
+- `franky-memory` would depend on franky's `ai` module at build time.
+- The extraction LLM call would happen **inside** the franky-memory package, using franky's HTTP client, retry logic, and streaming infrastructure.
+- The extraction would run as a background `std.Thread.spawn` after session end.
+
+**Problems with this approach:**
+
+1. **Circular dependency risk.** `franky-memory` imports `franky`'s `ai` module, while `franky` imports `franky-memory` as a package. While Zig's module system can handle this (they're not truly circular — franky-memory imports a *type*, franky imports a *module*), it creates tight coupling and makes franky-memory harder to test in isolation.
+
+2. **The LLM doesn't know about memory.** If the extraction runs as a background thread after the session ends, the agent itself never sees the extracted memories. It can't correct bad extractions, can't decide what's worth remembering, and can't use the memory mid-conversation.
+
+3. **Double LLM cost.** The extraction call uses the same LLM the user is already paying for. If the agent could extract memories *as part of its normal turn* (via a tool), there would be no separate extraction call — the agent would just call the tool when it decides something is worth remembering.
+
+4. **Inflexible trigger logic.** A background thread with a timer/checkpoint is a blunt instrument. The agent knows better than any heuristic when a task is done, when a decision was made, or when a fact was established.
+
+### 10.2 The New Design — Agent-Driven Memory via Tools
+
+Instead of franky-memory calling the LLM, **the LLM (agent) calls franky-memory via tools**. This inverts the control flow:
+
+```
+OLD:  franky-memory → calls LLM → extracts memories → writes to SQLite
+NEW:  agent (LLM) → calls memory_extract tool → franky-memory writes to SQLite
+```
+
+The agent is the intelligence; franky-memory is the storage. The agent decides what to remember, when to remember it, and how to phrase it. franky-memory just stores and retrieves.
+
+**Three components:**
+
+1. **`memory_search` tool** — the agent queries memory mid-conversation.
+2. **`memory_save` tool** — the agent saves a fact/decision/preference to L1.
+3. **`memory_recall` context injection** — franky injects recalled memory into the system prompt before each turn (or session start).
+
+Plus an optional **guardrail hook** that nudges the agent to save memory at certain lifecycle points (finish_task, end of session).
+
+### 10.3 Tool Design
+
+#### `memory_search` tool
+
+The agent calls this to find relevant memories. It hits the SQLite FTS5 index.
+
+```zig
+// In franky's src/coding/tools/memory_search.zig (new file)
+pub fn tool(ctx: *MemoryContext) at.AgentTool {
+    return .{
+        .name = "memory_search",
+        .description =
+            "Search persistent memory for relevant context from previous sessions. " ++
+            "Use this when you need to recall user preferences, past decisions, " ++
+            "or facts established in earlier conversations. " ++
+            "Pass a natural language query; results are ranked by relevance.",
+        .parameters_json =
+            \\{"type":"object","required":["query"],"properties":{
+            \\  "query":{"type":"string","description":"Natural language search query"},
+            \\  "limit":{"type":"integer","description":"Max results (default 5)","default":5}
+            \\}}
+        ,
+        .execution_mode = .parallel,
+        .ctx = @ptrCast(ctx),
+        .execute = execute,
+    };
+}
+
+fn execute(
+    tool: *const at.AgentTool,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    _: []const u8,
+    args_json: []const u8,
+    _: *ai.stream.Cancel,
+    _: at.OnUpdate,
+) !at.ToolResult {
+    const ctx: *MemoryContext = @ptrCast(@alignCast(tool.ctx.?));
+
+    // Parse args
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch {
+        return common.toolError(allocator, "invalid_args", "failed to parse JSON");
+    };
+    defer parsed.deinit();
+
+    const query = parsed.value.object.get("query")?.string;
+    const limit_obj = parsed.value.object.get("limit");
+    const limit: u32 = if (limit_obj) |l| @intCast(l.integer) else 5;
+
+    // Search L1 via FTS5
+    const results = ctx.store.searchL1Fts(allocator, query, limit, ctx.iso) catch {
+        return common.toolError(allocator, "search_failed", "memory search failed");
+    };
+    defer {
+        for (results) |r| r.deinit(allocator);
+        allocator.free(results);
+    }
+
+    // Format results as text for the agent
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    if (results.len == 0) {
+        try buf.appendSlice(allocator, "No memories found.");
+    } else {
+        for (results, 0..) |r, i| {
+            try buf.writer.print(allocator, "[{d}] ({s}, priority={d}) {s}\n", .{
+                i + 1, r.type.toString(), @as(i32, @intFromFloat(r.priority)), r.content,
+            });
+        }
+    }
+
+    return .{
+        .content = &.{.{ .text = .{ .text = try buf.toOwnedSlice(allocator) } }},
+    };
+}
+```
+
+#### `memory_save` tool
+
+The agent calls this to persist a memory. It writes directly to L1 (no extraction LLM call — the agent IS the extractor).
+
+```zig
+pub fn tool(ctx: *MemoryContext) at.AgentTool {
+    return .{
+        .name = "memory_save",
+        .description =
+            "Save a fact, decision, preference, or instruction to persistent memory. " ++
+            "This memory will be available in future sessions via memory_search. " ++
+            "Only save information that is durable (not one-time), self-contained " ++
+            "(makes sense without conversation context), and user or AI centric. " ++
+            "Do NOT save transient state, temporary values, or chitchat.",
+        .parameters_json =
+            \\{"type":"object","required":["content","type"],"properties":{
+            \\  "content":{"type":"string","description":"The memory text. Must be self-contained — readable without conversation context."},
+            \\  "type":{"type":"string","enum":["persona","episodic","instruction"],"description":"persona=user preferences/traits, episodic=events/decisions, instruction=rules/constraints"},
+            \\  "priority":{"type":"integer","description":"0-100, higher=more important. Default 50.","default":50},
+            \\  "scene_name":{"type":"string","description":"Scenario label (e.g. 'debugging auth module'). Default empty.","default":""}
+            \\}}
+        ,
+        .execution_mode = .parallel,
+        .ctx = @ptrCast(ctx),
+        .execute = execute,
+    };
+}
+
+fn execute(...) !at.ToolResult {
+    // Parse content, type, priority, scene_name from args
+    // Build L1Record
+    // Call ctx.store.upsertL1(record, null, ctx.iso)
+    // Return "Saved: <content>" to agent
+}
+```
+
+### 10.4 Context Injection (Recall into System Prompt)
+
+This is not a tool — it's a franky integration point. Before the system prompt is built, franky queries the memory store and injects a bounded context block:
+
+```zig
+// In franky's src/coding/memory.zig (new integration module)
+pub fn buildMemoryContext(
+    allocator: std.mem.Allocator,
+    store: *agent_memory.SqliteStore,
+    query: []const u8,  // typically the user's first prompt
+    iso: agent_memory.IsolationContext,
+) !?[]u8 {
+    var recall = try store.recall(allocator, query, 10, iso);
+    defer recall.deinit(allocator);
+
+    if (recall.total_chars == 0) return null;  // no memory
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "<memory_context>\n");
+
+    // L3 persona
+    if (recall.persona) |p| {
+        try buf.appendSlice(allocator, "## Persona\n");
+        try buf.appendSlice(allocator, p);
+        try buf.appendSlice(allocator, "\n\n");
+    }
+
+    // L1 facts
+    if (recall.l1_results.len > 0) {
+        try buf.appendSlice(allocator, "## Relevant Facts\n");
+        for (recall.l1_results) |r| {
+            try buf.writer.print(allocator, "- [{s}] {s}\n", .{
+                r.type.toString(), r.content,
+            });
+        }
+        try buf.appendSlice(allocator, "\n");
+    }
+
+    // L2 scenarios (if any)
+    for (recall.scenario_files) |s| {
+        try buf.writer.print(allocator, "## Scenario: {s}\n{s}\n\n", .{
+            s.path, s.content,
+        });
+    }
+
+    try buf.appendSlice(allocator, "</memory_context>");
+    return try buf.toOwnedSlice(allocator);
+}
+```
+
+This is called in `buildSystemPromptIo` (or just before it) in franky's mode drivers, with the user's prompt as the `query` to seed the FTS5 search.
+
+### 10.5 The Guardrail Hook — Nudge the Agent to Save Memory
+
+This is the "optional" part. The agent already has the `memory_save` tool and can call it whenever. But sometimes the agent forgets. A guardrail hook can nudge it.
+
+Franky already has a guardrail system (`src/agent/guardrails/`). The `GuardrailState` has:
+- `afterToolCall(tool, call_id, result)` — called after every tool execution.
+- `betweenTurns(allocator, io, transcript, out)` — called between turns, can inject messages.
+
+The hook would work like this:
+
+```
+Agent calls finish_task
+  → guardrails.afterToolCall sees finish_task was called
+  → guardrails.betweenTurns fires
+  → checks: has the agent saved any memory this session?
+  → if no: inject a synthetic user message:
+    "Before finishing, use memory_save to persist any important facts,
+    decisions, or preferences from this session for future reference."
+  → return true (wants another turn) so the agent gets the nudge
+```
+
+This is a **soft nudge**, not a forced extraction. The agent can still finish without saving if it judges there's nothing worth remembering. The nudge just reminds it.
+
+**Implementation in franky (not franky-memory):**
+
+The memory guardrail would be a new optional component in franky's `src/agent/guardrails/` or a new `src/coding/memory_guardrail.zig`. It would be wired into `GuardrailState` or be a separate hook:
+
+```zig
+// In franky's src/coding/memory_guardrail.zig (new, optional)
+pub const MemoryGuardrail = struct {
+    session_has_saved: bool = false,
+    nudge_count: u32 = 0,
+    max_nudges: u32 = 1,
+
+    pub fn afterToolCall(self: *MemoryGuardrail, tool: *const at.AgentTool) void {
+        if (std.mem.eql(u8, tool.name, "memory_save")) {
+            self.session_has_saved = true;
+        }
+    }
+
+    pub fn betweenTurns(
+        self: *MemoryGuardrail,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        transcript: *at.Transcript,
+        out: *at.AgentChannel,
+        finish_task_triggered: bool,
+    ) !bool {
+        // Only nudge on finish_task, and only if no memory was saved.
+        if (!finish_task_triggered) return false;
+        if (self.session_has_saved) return false;
+        if (self.nudge_count >= self.max_nudges) return false;
+
+        self.nudge_count += 1;
+
+        // Inject a synthetic user message nudging the agent to save memory.
+        const nudge = "Before finishing, if there are any important facts, decisions, " ++
+            "or user preferences from this session that would be useful in future sessions, " ++
+            "please use the memory_save tool to persist them.";
+        const content = try allocator.alloc(ai.types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = try allocator.dupe(u8, nudge) } };
+        try transcript.append(.{
+            .role = .user,
+            .content = content,
+            .timestamp = ai.stream.nowMillis(),
+        });
+
+        // Emit a tool_update so the UI shows the nudge.
+        // Return true = "give me another turn" so the agent sees the nudge.
+        return true;
+    }
+};
+```
+
+This is wired into the loop alongside the existing guardrails:
+
+```zig
+// In franky's loop.Config (or GuardrailState):
+memory_guardrail: ?*MemoryGuardrail = null,
+
+// In the loop's betweenTurns:
+if (config.guardrails) |gr| {
+    const finish_triggered = gr.finish_task_state.triggered;
+    if (config.memory_guardrail) |mg| {
+        if (try mg.betweenTurns(allocator, io, transcript, out, finish_triggered)) {
+            continue;  // give the agent another turn to save memory
+        }
+    }
+}
+```
+
+### 10.6 Why This Is Better
+
+| Aspect | LLM Registry (old) | Tool + Hook (new) |
+|--------|-------------------|-------------------|
+| **Who decides what to remember** | A separate extraction LLM call | The agent itself, during the conversation |
+| **LLM cost** | Extra extraction call per session | Zero extra calls (agent uses tools it already has) |
+| **Build dependency** | franky-memory depends on franky's `ai` module | franky-memory has zero dependencies; franky depends on franky-memory |
+| **Extraction quality** | LLM sees raw L0, extracts blindly | Agent has full context, knows what was important |
+| **Mid-conversation recall** | Not possible (extraction is post-hoc) | Agent calls `memory_search` any time |
+| **Correctability** | Agent can't fix bad extractions | Agent sees what was saved, can update/merge |
+| **Trigger flexibility** | Timer / checkpoint heuristic | Agent decides; guardrail nudges on finish_task |
+| **Testability** | franky-memory needs franky's registry to test | franky-memory tests with SQLite only; tool tests with a faux provider |
+
+### 10.7 Revised Phase 2 Deliverables
+
+**In `franky-memory` (the package):**
+
+1. **`store.zig` vtable additions** — expose `searchL1Fts`, `upsertL1`, `recall` through the vtable (already implemented in Phase 1 as `SqliteStore` methods; just need vtable wiring).
+
+2. **`context.zig`** — a `MemoryContext` struct that bundles `*SqliteStore` + `IsolationContext`. This is the `ctx` pointer passed to tools. No dependency on franky.
+
+3. **No extraction pipeline.** The `pipeline/` directory stays in the repo structure for future use but is not implemented. The agent IS the extraction pipeline.
+
+**In `franky` (the harness):**
+
+1. **`src/coding/tools/memory_search.zig`** — new tool, calls `store.searchL1Fts`.
+2. **`src/coding/tools/memory_save.zig`** — new tool, calls `store.upsertL1`.
+3. **`src/coding/memory.zig`** — integration module: `MemoryContext` setup, `buildMemoryContext()` for system prompt injection.
+4. **`src/coding/memory_guardrail.zig`** — optional guardrail that nudges the agent to save memory on `finish_task`.
+5. **`build.zig.zon`** — add `agent_memory` dependency.
+6. **`build.zig`** — add `agent_memory` module import.
+7. **Mode drivers** (`print.zig`, `interactive.zig`) — wire memory tools + context injection + guardrail.
+8. **System prompt** — add a section explaining the memory tools:
+
+```
+## Memory Tools
+
+You have access to persistent memory that survives across sessions:
+
+- **memory_search**: Search for relevant memories from previous sessions.
+  Use this when you need to recall user preferences, past decisions, or
+  facts established in earlier conversations.
+
+- **memory_save**: Save a fact, decision, preference, or instruction to
+  persistent memory. Only save information that is:
+  - Durable: not one-time or transient
+  - Self-contained: makes sense without conversation context
+  - User or AI centric: the subject is "User" or "AI"
+
+When you finish a task, consider whether anything worth remembering happened.
+If so, save it with memory_save before calling finish_task.
+```
+
+### 10.8 Revised Phase 2 Roadmap
+
+1. **franky-memory: vtable wiring + MemoryContext** (~0.5 day)
+   - Expose `searchL1Fts`, `upsertL1`, `recall` through `MemoryStore` vtable.
+   - Add `MemoryContext` struct (store + iso, no franky dependency).
+   - Tests.
+
+2. **franky: memory_search + memory_save tools** (~1 day)
+   - Two new tool files in `src/coding/tools/`.
+   - Register in mode drivers.
+   - System prompt section.
+   - Tests with faux provider.
+
+3. **franky: context injection** (~0.5 day)
+   - `buildMemoryContext()` in `src/coding/memory.zig`.
+   - Call in `buildSystemPromptIo` (or before it).
+   - Config: `--memory-db ~/.franky/memory.db`.
+
+4. **franky: memory guardrail** (~0.5 day)
+   - `MemoryGuardrail` in `src/coding/memory_guardrail.zig`.
+   - Wire into loop's `betweenTurns`.
+   - Config: `--memory-nudge` (default off).
+
+5. **franky: L0 capture** (~0.5 day)
+   - Capture messages to L0 after each turn (cheap SQLite INSERT).
+   - This gives the raw conversation log for future reference and
+     potential offline extraction (if we ever add it back).
+
+Total: ~3 days for Phase 2, split across both repos.
+
+### 10.9 The Key Insight
+
+The original TencentDB Agent Memory uses an **LLM-driven extraction pipeline** because it's a standalone service — it doesn't have an agent loop to piggyback on. It sees raw L0 messages and must run a separate LLM call to understand them.
+
+Franky is an **agent harness** — it has the agent loop, the LLM, and the tool infrastructure. The agent is already "thinking" during the conversation. Asking it to save a memory via a tool is like asking a human "hey, write that down." It's natural, cheap, and high-quality because the agent has full context.
+
+The guardrail nudge is the safety net — it reminds the agent to "write things down" before finishing, without forcing a separate extraction process. This is simpler, cheaper, and produces better memories than a blind post-hoc extraction.
