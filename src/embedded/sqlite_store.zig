@@ -15,6 +15,8 @@ const std = @import("std");
 const sqlite = @import("sqlite.zig");
 const types = @import("../types.zig");
 const rrf = @import("rrf.zig");
+const store = @import("../store.zig");
+const context = @import("../context.zig");
 
 const TAG = "[agent-memory]";
 
@@ -70,6 +72,13 @@ pub const SqliteStore = struct {
     pub fn deinit(self: *SqliteStore) void {
         self.db.close();
         self.allocator.free(self.data_dir);
+    }
+
+    /// Wrap this store in a `MemoryStore` vtable for use with `MemoryContext`.
+    /// The caller is responsible for keeping `self` alive for the lifetime
+    /// of the returned `MemoryStore`.
+    pub fn toMemoryStore(self: *SqliteStore) store.MemoryStore {
+        return .{ .ctx = @ptrCast(self), .vtable = &context.SqliteStoreVTable };
     }
 
     // ============================
