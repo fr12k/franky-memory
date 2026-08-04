@@ -207,13 +207,13 @@ var id_counter: std.atomic.Value(u64) = .init(0);
 
 fn generateId(allocator: std.mem.Allocator) ![]u8 {
     const c = id_counter.fetchAdd(1, .monotonic);
-    const ms = try nowMillis();
-    return std.fmt.allocPrint(allocator, "mem-{d}-{d}", .{ ms, c });
+    return std.fmt.allocPrint(allocator, "mem-{d}-{d}", .{ nowMillis(), c });
 }
 
 /// Current time as a millisecond timestamp (epoch).
-/// Returns an error if the system clock is unavailable.
-fn nowMillis() !i64 {
+/// Uses clock_gettime on Linux, falls back to 0 on failure or unsupported
+/// platforms. Matches franky's `ai.stream.nowMillis` signature exactly.
+fn nowMillis() i64 {
     const builtin = @import("builtin");
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
@@ -221,22 +221,22 @@ fn nowMillis() !i64 {
         if (linux.clock_gettime(.REALTIME, &ts) == 0) {
             return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
         }
-        return error.ClockUnavailable;
+        return 0;
     }
+    // POSIX (Darwin / BSD / other) via libc.
     if (builtin.link_libc) {
         var ts: std.c.timespec = undefined;
         if (std.c.clock_gettime(.REALTIME, &ts) == 0) {
             return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
         }
     }
-    return error.ClockUnavailable;
+    return 0;
 }
 
 /// Current time as a millisecond epoch string (NOT ISO 8601).
 /// Used for timestamp fields in L1Record. Returns an owned string.
 fn nowMillisStr(allocator: std.mem.Allocator) ![]u8 {
-    const ms = try nowMillis();
-    return std.fmt.allocPrint(allocator, "{d}", .{ms});
+    return std.fmt.allocPrint(allocator, "{d}", .{nowMillis()});
 }
 
 // ============================
