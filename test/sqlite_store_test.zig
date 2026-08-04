@@ -463,3 +463,52 @@ test "recall returns L3 + L2 + L1" {
     // total_chars should be non-zero.
     try std.testing.expect(result.total_chars > 0);
 }
+
+test "toMemoryStore + MemoryContext round-trip" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    // Wrap the SqliteStore in a MemoryStore vtable.
+    const mem_store = ctx.store.toMemoryStore();
+
+    // Use the vtable to save a memory.
+    const iso = types.IsolationContext{ .session_id = "s1" };
+    const record = types.L1Record{
+        .record_id = "mem-vtable-001",
+        .content = "User likes Zig",
+        .type = .persona,
+        .priority = 85,
+        .scene_name = "preferences",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "",
+        .updated_time = "",
+        .metadata_json = "{}",
+    };
+    _ = try mem_store.upsertL1(record, null, iso);
+
+    // Search via the vtable.
+    const results = try mem_store.searchL1(ctx.allocator, "Zig", 5, iso);
+    defer {
+        for (results) |r| r.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("mem-vtable-001", results[0].record_id);
+    try std.testing.expectEqualStrings("User likes Zig", results[0].content);
+
+    // Recall via the vtable.
+    var recall = try mem_store.recall(ctx.allocator, "Zig", 5, iso);
+    defer recall.deinit(ctx.allocator);
+    try std.testing.expectEqual(@as(usize, 1), recall.l1_results.len);
+    try std.testing.expect(recall.total_chars > 0);
+}

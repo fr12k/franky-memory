@@ -14,6 +14,7 @@ const std = @import("std");
 // Public API
 pub const types = @import("types.zig");
 pub const store = @import("store.zig");
+pub const context = @import("context.zig");
 pub const embedded = @import("embedded/sqlite_store.zig");
 pub const rrf = @import("embedded/rrf.zig");
 
@@ -34,10 +35,12 @@ pub const DedupAction = types.DedupAction;
 pub const DedupDecision = types.DedupDecision;
 pub const MemoryStore = store.MemoryStore;
 pub const SqliteStore = embedded.SqliteStore;
+pub const MemoryContext = context.MemoryContext;
 
 test {
     // Pull in all test files when running `zig test`.
     std.testing.refAllDecls(types);
     std.testing.refAllDecls(rrf);
     std.testing.refAllDecls(embedded);
+    std.testing.refAllDecls(context);
 }
