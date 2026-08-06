@@ -203,7 +203,15 @@ fn vtableSetCheckpoint(ctx: *anyopaque, checkpoint: types.Checkpoint) !void {
 // ============================
 
 /// Generate a unique memory record ID: "mem-<timestamp>-<counter>"
-var id_counter: std.atomic.Value(u64) = .init(0);
+///
+/// The counter type is selected at comptime: `u64` on 64-bit targets and
+/// `u32` on 32-bit targets. 32-bit x86 with the baseline CPU (no cmpxchg8b)
+/// cannot perform 64-bit atomic read-modify-write operations, so
+/// `@atomicRmw` (used by `fetchAdd`) rejects `u64` there. A `u32` counter
+/// is ample for a per-process monotonic counter that is only combined
+/// with a millisecond timestamp to disambiguate IDs within the same ms.
+const CounterType = if (@sizeOf(usize) <= 4) u32 else u64;
+var id_counter: std.atomic.Value(CounterType) = .init(0);
 
 fn generateId(allocator: std.mem.Allocator) ![]u8 {
     const c = id_counter.fetchAdd(1, .monotonic);
