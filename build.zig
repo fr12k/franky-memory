@@ -1,8 +1,53 @@
 const std = @import("std");
 
+/// v0.2.0 — vendor the SQLite amalgamation (vendor/sqlite3.c) and compile
+/// it into a static library. This eliminates the system-library dependency
+/// (libsqlite3-dev / sqlite-dev) so:
+///   - CI images don't need to install sqlite-dev.
+///   - Cross-compilation works (the goreleaser step builds for 5 targets;
+///     a system libsqlite3 only works for the native host triple).
+/// FTS5 is enabled via -DSQLITE_ENABLE_FTS5.
+///
+/// Returns a `*Step.Compile` static library that callers link via
+/// `mod.linkLibrary(sqlite_lib)`.
+fn buildSqliteLib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const c_flags: []const []const u8 = &.{
+        "-DSQLITE_ENABLE_FTS5",
+        "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+        "-DSQLITE_DEFAULT_BUSY_TIMEOUT=5000",
+        "-DSQLITE_THREADSAFE=1",
+        "-DSQLITE_OMIT_LOAD_EXTENSION",
+        // Silence warnings on the amalgamation under -OReleaseFast.
+        "-Wno-unused-function",
+        "-Wno-unused-variable",
+        "-Wno-unused-but-set-variable",
+    };
+
+    // Create a module with no root source file — the C source is added
+    // via addCSourceFile so we can pass compile flags.
+    const sqlite_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sqlite_mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite3.c"),
+        .flags = c_flags,
+    });
+
+    return b.addLibrary(.{
+        .name = "sqlite3",
+        .root_module = sqlite_mod,
+        .linkage = .static,
+    });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // v0.2.0 — compile vendored SQLite amalgamation into a static lib.
+    const sqlite_lib = buildSqliteLib(b, target, optimize);
 
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -10,25 +55,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-
-    // Link system sqlite3 (requires libsqlite3-dev / libsqlite3).
-    // We use the system library so we don't have to vendor the 9MB amalgamation.
-    // FTS5 support is compiled into the system libsqlite3 on Debian/Ubuntu.
-    lib_mod.linkSystemLibrary("sqlite3", .{});
+    lib_mod.linkLibrary(sqlite_lib);
 
     // Export the module under the name "agent_memory" so that dependents
     // can call `agent_memory_dep.module("agent_memory")` to import it.
+    // The exported module links sqlite3 from source, so dependents no
+    // longer need to linkSystemLibrary("sqlite3") themselves.
     _ = b.addModule("agent_memory", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    // NOTE: the module needs sqlite3 linked too — dependents who use this
-    // module must also link sqlite3 (or we need to put linkSystemLibrary on
-    // the exported module). For now the exported module above does NOT link
-    // sqlite3; the consuming project (franky) is responsible for linking it.
-    // The self-tests below link it via test_mod.
+
+    // Install the sqlite3 static lib as a named artifact so dependents
+    // can link it via `dep.artifact("sqlite3")`.
+    b.installArtifact(sqlite_lib);
 
     const lib = b.addLibrary(.{
         .name = "agent_memory",
@@ -42,7 +84,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    test_mod.linkSystemLibrary("sqlite3", .{});
+    test_mod.linkLibrary(sqlite_lib);
 
     const test_bin = b.addTest(.{
         .name = "agent-memory-tests",
@@ -60,7 +102,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    itest_mod.linkSystemLibrary("sqlite3", .{});
+    itest_mod.linkLibrary(sqlite_lib);
     itest_mod.addImport("agent_memory", lib_mod);
 
     const itest_bin = b.addTest(.{
