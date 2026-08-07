@@ -92,7 +92,7 @@ defer recall.deinit(allocator);
 
 Requires:
 - Zig 0.17.0-dev (master)
-- libsqlite3-dev (system package, for FTS5 support)
+- No system SQLite needed — the SQLite 3.53.4 amalgamation is vendored in `vendor/` and compiled from source (FTS5 enabled).
 
 ```bash
 zig build              # Build the library
@@ -112,3 +112,5 @@ MIT
 ## Acknowledgements
 
 This project is inspired by and ports key concepts from [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) by Tencent Cloud. The memory pyramid (L0–L3), FTS5 + RRF hybrid search, and L1 extraction pipeline design originate from that project.
+
+The vendored SQLite amalgamation (`vendor/sqlite3.c`, `vendor/sqlite3.h`) is SQLite 3.53.4 (2026-07-24), from <https://sqlite.org/2026/sqlite-amalgamation-3530400.zip>.
