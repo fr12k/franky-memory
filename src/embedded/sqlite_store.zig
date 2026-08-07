@@ -15,6 +15,7 @@ const std = @import("std");
 const sqlite = @import("sqlite.zig");
 const types = @import("../types.zig");
 const rrf = @import("rrf.zig");
+const vector = @import("vector.zig");
 const store = @import("../store.zig");
 const context = @import("../context.zig");
 
@@ -134,6 +135,9 @@ pub const SqliteStore = struct {
         filter: types.L0QueryFilter,
         iso: types.IsolationContext,
     ) ![]types.L0Record {
+        var time_start_ms_val: ?i64 = null;
+        _ = &time_start_ms_val;
+
         var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(allocator);
         try sql_buf.appendSlice(
@@ -162,7 +166,8 @@ pub const SqliteStore = struct {
         }
         if (filter.time_start_ms) |ts| {
             try sql_buf.appendSlice(allocator, " AND timestamp >= ?");
-            _ = ts; // will bind as int below — TODO: use separate int params
+            // Store the int value to bind after string params.
+            time_start_ms_val = ts;
         }
 
         // Order + limit.
@@ -186,8 +191,10 @@ pub const SqliteStore = struct {
             try stmt.bindText(@intCast(i), p);
         }
 
-        // Bind int params for time_start_ms (if any).
-        // TODO: proper mixed-type param binding.
+        // Bind int param for time_start_ms (if any) at the next position.
+        if (time_start_ms_val) |ts| {
+            try stmt.bindInt(@intCast(params.items.len + 1), ts);
+        }
 
         var results: std.ArrayList(types.L0Record) = .empty;
         defer results.deinit(allocator);
@@ -418,23 +425,154 @@ pub const SqliteStore = struct {
         return try results.toOwnedSlice(allocator);
     }
 
+    /// Vector similarity search on L1 records using cosine similarity.
+    /// `query_embedding` is the f32 embedding vector for the query.
+    /// Returns SearchResult slice sorted by similarity descending.
+    pub fn searchL1Vector(
+        self: *SqliteStore,
+        allocator: std.mem.Allocator,
+        query_embedding: []const f32,
+        top_k: u32,
+        iso: types.IsolationContext,
+    ) ![]types.SearchResult {
+        if (query_embedding.len == 0) return &.{};
+
+        // Fetch all L1 records that have embeddings, scoped by isolation.
+        const sql =
+            "SELECT e.record_id, e.embedding, e.dimensions, " ++
+            "l.content, l.type, l.priority, l.scene_name, " ++
+            "l.session_id, l.team_id, l.user_id, l.agent_id " ++
+            "FROM l1_embeddings e JOIN l1_records l ON e.record_id = l.record_id " ++
+            "WHERE l.team_id = ? AND l.agent_id = ? AND l.user_id = ?";
+
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+
+        try stmt.bindText(1, iso.team_id);
+        try stmt.bindText(2, iso.agent_id);
+        try stmt.bindText(3, iso.user_id);
+
+        // Collect candidate embeddings + metadata.
+        const Candidate = struct {
+            record_id: []u8,
+            content: []u8,
+            mem_type: types.MemoryType,
+            priority: f32,
+            scene_name: []u8,
+            session_id: []u8,
+            team_id: []u8,
+            user_id: []u8,
+            agent_id: []u8,
+            embedding: []f32,
+        };
+
+        var candidates: std.ArrayList(Candidate) = .empty;
+        defer {
+            for (candidates.items) |c| {
+                allocator.free(c.record_id);
+                allocator.free(c.content);
+                allocator.free(c.scene_name);
+                allocator.free(c.session_id);
+                allocator.free(c.team_id);
+                allocator.free(c.user_id);
+                allocator.free(c.agent_id);
+                allocator.free(c.embedding);
+            }
+            candidates.deinit(allocator);
+        }
+
+        while (try stmt.step()) {
+            const blob = stmt.columnBlob(1);
+            const emb = vector.decodeBlob(allocator, blob) catch continue;
+            const mem_type = types.MemoryType.fromString(stmt.columnText(4)) orelse .episodic;
+            try candidates.append(allocator, .{
+                .record_id = try allocator.dupe(u8, stmt.columnText(0)),
+                .content = try allocator.dupe(u8, stmt.columnText(3)),
+                .mem_type = mem_type,
+                .priority = @floatCast(stmt.columnFloat(5)),
+                .scene_name = try allocator.dupe(u8, stmt.columnText(6)),
+                .session_id = try allocator.dupe(u8, stmt.columnText(7)),
+                .team_id = try allocator.dupe(u8, stmt.columnText(8)),
+                .user_id = try allocator.dupe(u8, stmt.columnText(9)),
+                .agent_id = try allocator.dupe(u8, stmt.columnText(10)),
+                .embedding = emb,
+            });
+        }
+
+        if (candidates.items.len == 0) return &.{};
+
+        // Compute top-k by cosine similarity.
+        var embeddings = try allocator.alloc([]const f32, candidates.items.len);
+        defer allocator.free(embeddings);
+        for (candidates.items, 0..) |c, i| embeddings[i] = c.embedding;
+
+        const scored = try vector.topK(allocator, query_embedding, embeddings, top_k);
+        defer allocator.free(scored);
+
+        var results: std.ArrayList(types.SearchResult) = .empty;
+        defer results.deinit(allocator);
+        errdefer {
+            for (results.items) |r| r.deinit(allocator);
+        }
+
+        for (scored) |s| {
+            const c = candidates.items[s.index];
+            try results.append(allocator, .{
+                .record_id = try allocator.dupe(u8, c.record_id),
+                .content = try allocator.dupe(u8, c.content),
+                .type = c.mem_type,
+                .priority = c.priority,
+                .scene_name = try allocator.dupe(u8, c.scene_name),
+                .score = s.score,
+                .session_id = try allocator.dupe(u8, c.session_id),
+                .team_id = try allocator.dupe(u8, c.team_id),
+                .user_id = try allocator.dupe(u8, c.user_id),
+                .agent_id = try allocator.dupe(u8, c.agent_id),
+            });
+        }
+
+        return try results.toOwnedSlice(allocator);
+    }
+
     /// Hybrid search: FTS + optional vector, merged with RRF.
+    /// When `query_embedding` is provided, FTS and vector results are
+    /// fused via Reciprocal Rank Fusion. Otherwise, FTS-only.
     pub fn searchL1Hybrid(
         self: *SqliteStore,
         allocator: std.mem.Allocator,
         query: []const u8,
         top_k: u32,
         iso: types.IsolationContext,
+        query_embedding: ?[]const f32,
     ) ![]types.SearchResult {
         if (!self.capabilities.fts_search) return &.{};
 
         // Phase 1: FTS5 search.
         const fts_results = try self.searchL1Fts(allocator, query, top_k, iso);
-        // No vector search yet (Phase 2 will add embeddings).
 
-        // For now, just return FTS results directly.
-        // When vector search is added, RRF-merge fts_results + vec_results.
-        return fts_results;
+        // If no query embedding, return FTS-only.
+        if (query_embedding == null) return fts_results;
+
+        // Phase 2: Vector search.
+        const vec_results = try self.searchL1Vector(allocator, query_embedding.?, top_k, iso);
+
+        // If either result set is empty, return the non-empty one.
+        if (fts_results.len == 0) return vec_results;
+        if (vec_results.len == 0) return fts_results;
+
+        // RRF-merge FTS + vector results.
+        // Both lists need to be freed after merge, but merge deep-copies.
+        defer {
+            for (fts_results) |r| r.deinit(allocator);
+            allocator.free(fts_results);
+        }
+        defer {
+            for (vec_results) |r| r.deinit(allocator);
+            allocator.free(vec_results);
+        }
+
+        const lists = [_][]const types.SearchResult{ fts_results, vec_results };
+        return try rrf.merge(allocator, &lists, top_k);
     }
 
     // ============================
@@ -540,7 +678,6 @@ pub const SqliteStore = struct {
         iso: types.IsolationContext,
     ) ![]types.ScenarioFile {
         _ = iso;
-        _ = path_prefix; // TODO: implement prefix filtering
         const dir_path = try std.fmt.allocPrint(allocator, "{s}/scene_blocks", .{self.data_dir});
         defer allocator.free(dir_path);
 
@@ -561,6 +698,11 @@ pub const SqliteStore = struct {
         while (try iter.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+
+            // Apply prefix filtering if provided.
+            if (path_prefix) |prefix| {
+                if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+            }
 
             const content = self.readScenario(allocator, entry.name, .{}) catch continue;
             if (content) |c| {
@@ -591,7 +733,7 @@ pub const SqliteStore = struct {
         const scenarios = try self.listScenarios(allocator, null, iso);
 
         // L1 hybrid search.
-        const l1_results = try self.searchL1Hybrid(allocator, query, top_k, iso);
+        const l1_results = try self.searchL1Hybrid(allocator, query, top_k, iso, null);
 
         // Compute total chars for budget capping.
         var total_chars: usize = 0;
@@ -795,10 +937,27 @@ fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
 
 /// Parse a checkpoint JSON value: {"timestamp": "...", "scene_name": "..."}
 fn parseCheckpoint(allocator: std.mem.Allocator, json: []const u8) !types.Checkpoint {
-    _ = allocator;
-    _ = json;
-    // Simple parse — for now, return empty. Phase 2 will use std.json.
-    return .{};
+    if (json.len == 0) return .{};
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return .{};
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return .{};
+    const obj = parsed.value.object;
+
+    var checkpoint: types.Checkpoint = .{};
+
+    if (obj.get("timestamp")) |ts| {
+        if (ts == .string) {
+            checkpoint.last_processed_timestamp = try allocator.dupe(u8, ts.string);
+        }
+    }
+    if (obj.get("scene_name")) |sn| {
+        if (sn == .string) {
+            checkpoint.last_scene_name = try allocator.dupe(u8, sn.string);
+        }
+    }
+    return checkpoint;
 }
 
 /// Serialize a checkpoint to JSON.

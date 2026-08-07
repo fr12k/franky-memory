@@ -405,9 +405,21 @@ test "checkpoint set + get round-trip" {
     try ctx.store.setCheckpoint(checkpoint);
 
     const read = try ctx.store.getCheckpoint(ctx.allocator);
-    // Note: parseCheckpoint is a stub in Phase 1; it returns empty.
-    // This test verifies set doesn't crash. Phase 2 will implement parse.
-    _ = read;
+    defer read.deinit(ctx.allocator);
+
+    try std.testing.expect(read.last_processed_timestamp != null);
+    try std.testing.expect(read.last_scene_name != null);
+    try std.testing.expectEqualStrings("2025-01-15T10:05:00Z", read.last_processed_timestamp.?);
+    try std.testing.expectEqualStrings("database setup", read.last_scene_name.?);
+}
+
+test "checkpoint get when empty returns empty" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const read = try ctx.store.getCheckpoint(ctx.allocator);
+    try std.testing.expect(read.last_processed_timestamp == null);
+    try std.testing.expect(read.last_scene_name == null);
 }
 
 test "recall returns L3 + L2 + L1" {
@@ -511,4 +523,181 @@ test "toMemoryStore + MemoryContext round-trip" {
     defer recall.deinit(ctx.allocator);
     try std.testing.expectEqual(@as(usize, 1), recall.l1_results.len);
     try std.testing.expect(recall.total_chars > 0);
+}
+test "L1 upsert with embedding + vector search" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    // Insert two records with embeddings.
+    const emb1 = [_]f32{ 1.0, 0.0, 0.0 };
+    const emb2 = [_]f32{ 0.0, 1.0, 0.0 };
+    const emb3 = [_]f32{ 0.9, 0.1, 0.0 }; // close to emb1
+
+    const rec1 = types.L1Record{
+        .record_id = "vec-001",
+        .content = "User likes PostgreSQL",
+        .type = .persona,
+        .priority = 80,
+        .scene_name = "db",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "",
+        .updated_time = "",
+        .metadata_json = "{}",
+    };
+    var rec2 = rec1;
+    rec2.record_id = "vec-002";
+    rec2.content = "User likes MySQL";
+    var rec3 = rec1;
+    rec3.record_id = "vec-003";
+    rec3.content = "User likes SQLite";
+
+    _ = try ctx.store.upsertL1(rec1, &emb1, iso);
+    _ = try ctx.store.upsertL1(rec2, &emb2, iso);
+    _ = try ctx.store.upsertL1(rec3, &emb3, iso);
+
+    // Search with query embedding close to emb1 (should rank vec-001 first).
+    const query_emb = [_]f32{ 0.95, 0.05, 0.0 };
+    const results = try ctx.store.searchL1Vector(ctx.allocator, &query_emb, 3, iso);
+    defer {
+        for (results) |r| r.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    // vec-001 should be top (closest to query), vec-003 second, vec-002 last.
+    try std.testing.expectEqualStrings("vec-001", results[0].record_id);
+    try std.testing.expect(results[0].score >= results[1].score);
+    try std.testing.expect(results[1].score >= results[2].score);
+}
+
+test "L1 hybrid search with FTS + vector via RRF" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    // Insert records with embeddings.
+    const emb1 = [_]f32{ 1.0, 0.0 };
+    const emb2 = [_]f32{ 0.0, 1.0 };
+
+    const rec1 = types.L1Record{
+        .record_id = "hybrid-001",
+        .content = "User prefers PostgreSQL database",
+        .type = .persona,
+        .priority = 80,
+        .scene_name = "db",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "",
+        .updated_time = "",
+        .metadata_json = "{}",
+    };
+    var rec2 = rec1;
+    rec2.record_id = "hybrid-002";
+    rec2.content = "User likes MySQL";
+
+    _ = try ctx.store.upsertL1(rec1, &emb1, iso);
+    _ = try ctx.store.upsertL1(rec2, &emb2, iso);
+
+    // Hybrid search: FTS query "PostgreSQL" + embedding close to rec1.
+    const query_emb = [_]f32{ 0.95, 0.05 };
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "PostgreSQL", 5, iso, &query_emb);
+    defer {
+        for (results) |r| r.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+
+    // Should return results (RRF-merged).
+    try std.testing.expect(results.len > 0);
+    // hybrid-001 should be top (matches both FTS and vector).
+    try std.testing.expectEqualStrings("hybrid-001", results[0].record_id);
+}
+
+test "L1 hybrid search without embedding returns FTS only" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    const rec1 = types.L1Record{
+        .record_id = "hybrid-003",
+        .content = "User prefers dark mode",
+        .type = .persona,
+        .priority = 70,
+        .scene_name = "ui",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "",
+        .updated_time = "",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(rec1, null, iso);
+
+    // Hybrid search with null embedding — should work as FTS-only.
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "dark", 5, iso, null);
+    defer {
+        for (results) |r| r.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("hybrid-003", results[0].record_id);
+}
+
+test "listScenarios with prefix filter" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+
+    try ctx.store.writeScenario("alpha-setup.md", "Alpha setup content", iso);
+    try ctx.store.writeScenario("alpha-config.md", "Alpha config content", iso);
+    try ctx.store.writeScenario("beta-deploy.md", "Beta deploy content", iso);
+
+    // List with prefix "alpha" — should return 2 files.
+    const results = try ctx.store.listScenarios(ctx.allocator, "alpha", iso);
+    defer {
+        for (results) |f| f.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |f| {
+        try std.testing.expect(std.mem.startsWith(u8, f.path, "alpha"));
+    }
+
+    // List with no prefix — should return all 3.
+    const all = try ctx.store.listScenarios(ctx.allocator, null, iso);
+    defer {
+        for (all) |f| f.deinit(ctx.allocator);
+        ctx.allocator.free(all);
+    }
+    try std.testing.expectEqual(@as(usize, 3), all.len);
 }

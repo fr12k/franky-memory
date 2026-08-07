@@ -155,7 +155,7 @@ fn vtableUpsertL1(ctx: *anyopaque, record: types.L1Record, embedding: ?[]const f
 
 fn vtableSearchL1(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.searchL1Hybrid(allocator, query, top_k, iso);
+    return self.searchL1Hybrid(allocator, query, top_k, iso, null);
 }
 
 fn vtableReadCore(ctx: *anyopaque, allocator: std.mem.Allocator, iso: types.IsolationContext) !?[]u8 {
