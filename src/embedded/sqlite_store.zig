@@ -135,6 +135,9 @@ pub const SqliteStore = struct {
         filter: types.L0QueryFilter,
         iso: types.IsolationContext,
     ) ![]types.L0Record {
+        var time_start_ms_val: ?i64 = null;
+        _ = &time_start_ms_val;
+
         var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(allocator);
         try sql_buf.appendSlice(
@@ -163,7 +166,8 @@ pub const SqliteStore = struct {
         }
         if (filter.time_start_ms) |ts| {
             try sql_buf.appendSlice(allocator, " AND timestamp >= ?");
-            _ = ts; // will bind as int below — TODO: use separate int params
+            // Store the int value to bind after string params.
+            time_start_ms_val = ts;
         }
 
         // Order + limit.
@@ -187,8 +191,10 @@ pub const SqliteStore = struct {
             try stmt.bindText(@intCast(i), p);
         }
 
-        // Bind int params for time_start_ms (if any).
-        // TODO: proper mixed-type param binding.
+        // Bind int param for time_start_ms (if any) at the next position.
+        if (time_start_ms_val) |ts| {
+            try stmt.bindInt(@intCast(params.items.len + 1), ts);
+        }
 
         var results: std.ArrayList(types.L0Record) = .empty;
         defer results.deinit(allocator);
