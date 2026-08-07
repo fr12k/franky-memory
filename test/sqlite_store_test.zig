@@ -701,3 +701,95 @@ test "listScenarios with prefix filter" {
     }
     try std.testing.expectEqual(@as(usize, 3), all.len);
 }
+
+test "recallWithBudget caps total content" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+
+    // Write L3 persona (10 chars).
+    try ctx.store.writeCore("User likes dark mode.", iso); // 20 chars
+
+    // Write L2 scenario (10 chars).
+    try ctx.store.writeScenario("setup.md", "Setup instructions here.", iso); // 25 chars
+
+    // Write L1 records.
+    const rec1 = types.L1Record{
+        .record_id = "budget-001",
+        .content = "User prefers PostgreSQL over MySQL", // 36 chars
+        .type = .persona,
+        .priority = 80,
+        .scene_name = "db",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "",
+        .updated_time = "",
+        .metadata_json = "{}",
+    };
+    var rec2 = rec1;
+    rec2.record_id = "budget-002";
+    rec2.content = "User likes Python programming language"; // 39 chars
+
+    _ = try ctx.store.upsertL1(rec1, null, iso);
+    _ = try ctx.store.upsertL1(rec2, null, iso);
+
+    // Recall with unlimited budget — should get everything.
+    var unlimited = try ctx.store.recallWithBudget(ctx.allocator, "PostgreSQL", 5, iso, 0);
+    defer unlimited.deinit(ctx.allocator);
+    try std.testing.expect(unlimited.total_chars > 0);
+    try std.testing.expectEqual(@as(usize, 2), unlimited.l1_results.len);
+
+    // Recall with tight budget (50 chars) — persona (20) + 1 L1 (36) = 56 > 50, so persona + 0 L1.
+    var capped = try ctx.store.recallWithBudget(ctx.allocator, "PostgreSQL", 5, iso, 50);
+    defer capped.deinit(ctx.allocator);
+    try std.testing.expect(capped.total_chars <= 50);
+    try std.testing.expect(capped.persona != null); // persona always included first
+    // L1 results may be empty if persona alone fills budget.
+}
+
+test "recallWithBudget with zero budget returns everything" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+
+    try ctx.store.writeCore("Persona text", iso);
+    try ctx.store.writeScenario("s.md", "Scenario content", iso);
+
+    const rec = types.L1Record{
+        .record_id = "budget-003",
+        .content = "Some memory content",
+        .type = .episodic,
+        .priority = 50,
+        .scene_name = "",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "",
+        .updated_time = "",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(rec, null, iso);
+
+    var result = try ctx.store.recallWithBudget(ctx.allocator, "memory", 5, iso, 0);
+    defer result.deinit(ctx.allocator);
+    try std.testing.expect(result.persona != null);
+    try std.testing.expectEqual(@as(usize, 1), result.scenario_files.len);
+    try std.testing.expectEqual(@as(usize, 1), result.l1_results.len);
+}
