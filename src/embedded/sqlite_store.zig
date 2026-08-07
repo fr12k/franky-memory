@@ -719,6 +719,7 @@ pub const SqliteStore = struct {
 
     /// The main entry point for prompt injection.
     /// Searches L1 (hybrid), reads L2/L3, and returns a bounded RecallResult.
+    /// No character budget capping — use recallWithBudget for that.
     pub fn recall(
         self: *SqliteStore,
         allocator: std.mem.Allocator,
@@ -726,25 +727,102 @@ pub const SqliteStore = struct {
         top_k: u32,
         iso: types.IsolationContext,
     ) !types.RecallResult {
-        // L3 persona.
+        return self.recallWithBudget(allocator, query, top_k, iso, 0);
+    }
+
+    /// Recall with character budget capping. When `max_chars` > 0, the result
+    /// is truncated to fit within the budget. Priority: L3 persona always included,
+    /// then L1 results (most relevant first), then L2 scenarios. Items that don't
+    /// fit are dropped entirely (not partially truncated).
+    /// Use `max_chars = 0` for unlimited (same as recall()).
+    pub fn recallWithBudget(
+        self: *SqliteStore,
+        allocator: std.mem.Allocator,
+        query: []const u8,
+        top_k: u32,
+        iso: types.IsolationContext,
+        max_chars: usize,
+    ) !types.RecallResult {
+        // L3 persona — always included (if exists).
         const persona = try self.readCore(allocator, iso);
 
         // L2 scenarios (all for now; TODO: filter by relevance).
-        const scenarios = try self.listScenarios(allocator, null, iso);
+        const all_scenarios = try self.listScenarios(allocator, null, iso);
 
         // L1 hybrid search.
-        const l1_results = try self.searchL1Hybrid(allocator, query, top_k, iso, null);
+        const all_l1 = try self.searchL1Hybrid(allocator, query, top_k, iso, null);
 
-        // Compute total chars for budget capping.
+        // If no budget, return everything.
+        if (max_chars == 0) {
+            var total_chars: usize = 0;
+            if (persona) |p| total_chars += p.len;
+            for (all_scenarios) |s| total_chars += s.content.len;
+            for (all_l1) |r| total_chars += r.content.len;
+            return .{
+                .persona = persona,
+                .scenario_files = all_scenarios,
+                .l1_results = all_l1,
+                .total_chars = total_chars,
+            };
+        }
+
+        // Budget capping: persona first, then L1 (most relevant), then L2.
+        var remaining = max_chars;
         var total_chars: usize = 0;
-        if (persona) |p| total_chars += p.len;
-        for (scenarios) |s| total_chars += s.content.len;
-        for (l1_results) |r| total_chars += r.content.len;
+
+        // Persona.
+        var capped_persona: ?[]u8 = null;
+        if (persona) |p| {
+            if (p.len <= remaining) {
+                capped_persona = p;
+                remaining -= p.len;
+                total_chars += p.len;
+            } else {
+                // Persona doesn't fit — drop it (and its allocation).
+                allocator.free(p);
+            }
+        }
+
+        // L1 results (already sorted by relevance from searchL1Hybrid).
+        var capped_l1: []types.SearchResult = all_l1;
+        var l1_count: usize = 0;
+        for (all_l1) |r| {
+            if (r.content.len <= remaining) {
+                remaining -= r.content.len;
+                total_chars += r.content.len;
+                l1_count += 1;
+            } else {
+                break; // stop at first that doesn't fit
+            }
+        }
+        if (l1_count < all_l1.len) {
+            // Free the ones that didn't fit.
+            for (all_l1[l1_count..]) |r| r.deinit(allocator);
+            // Shrink the slice — need to realloc.
+            capped_l1 = try allocator.realloc(all_l1, l1_count);
+        }
+
+        // L2 scenarios.
+        var capped_scenarios: []types.ScenarioFile = all_scenarios;
+        var scenario_count: usize = 0;
+        for (all_scenarios) |s| {
+            if (s.content.len <= remaining) {
+                remaining -= s.content.len;
+                total_chars += s.content.len;
+                scenario_count += 1;
+            } else {
+                break;
+            }
+        }
+        if (scenario_count < all_scenarios.len) {
+            for (all_scenarios[scenario_count..]) |s| s.deinit(allocator);
+            capped_scenarios = try allocator.realloc(all_scenarios, scenario_count);
+        }
 
         return .{
-            .persona = persona,
-            .scenario_files = scenarios,
-            .l1_results = l1_results,
+            .persona = capped_persona,
+            .scenario_files = capped_scenarios,
+            .l1_results = capped_l1,
             .total_chars = total_chars,
         };
     }

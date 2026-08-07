@@ -1,6 +1,6 @@
 .{
     .name = .agent_memory,
-    .version = "0.0.2",
+    .version = "0.1.0",
     .fingerprint = 0xb48a63137efafdc9,
     .minimum_zig_version = "0.17.0-dev",
     .paths = .{
