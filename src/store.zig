@@ -31,19 +31,6 @@ pub const MemoryStore = struct {
             iso: types.IsolationContext,
         ) anyerror![]types.SearchResult,
 
-        // L3 persona
-        read_core: *const fn (
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            iso: types.IsolationContext,
-        ) anyerror!?[]u8,
-
-        write_core: *const fn (
-            ctx: *anyopaque,
-            content: []const u8,
-            iso: types.IsolationContext,
-        ) anyerror!void,
-
         // Recall
         recall: *const fn (
             ctx: *anyopaque,
@@ -81,14 +68,6 @@ pub const MemoryStore = struct {
 
     pub fn searchL1(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
         return self.vtable.search_l1(self.ctx, allocator, query, top_k, iso);
-    }
-
-    pub fn readCore(self: MemoryStore, allocator: std.mem.Allocator, iso: types.IsolationContext) !?[]u8 {
-        return self.vtable.read_core(self.ctx, allocator, iso);
-    }
-
-    pub fn writeCore(self: MemoryStore, content: []const u8, iso: types.IsolationContext) !void {
-        return self.vtable.write_core(self.ctx, content, iso);
     }
 
     pub fn recall(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
