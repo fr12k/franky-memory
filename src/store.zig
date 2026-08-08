@@ -15,28 +15,6 @@ pub const MemoryStore = struct {
         deinit: *const fn (ctx: *anyopaque) void,
         capabilities: *const fn (ctx: *anyopaque) types.StoreCapabilities,
 
-        // L0
-        add_conversation: *const fn (
-            ctx: *anyopaque,
-            records: []const types.L0Record,
-            iso: types.IsolationContext,
-        ) anyerror!void,
-
-        query_conversation: *const fn (
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            filter: types.L0QueryFilter,
-            iso: types.IsolationContext,
-        ) anyerror![]types.L0Record,
-
-        search_conversation: *const fn (
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            query: []const u8,
-            top_k: u32,
-            iso: types.IsolationContext,
-        ) anyerror![]types.SearchResult,
-
         // L1
         upsert_l1: *const fn (
             ctx: *anyopaque,
@@ -116,18 +94,6 @@ pub const MemoryStore = struct {
 
     pub fn capabilities(self: MemoryStore) types.StoreCapabilities {
         return self.vtable.capabilities(self.ctx);
-    }
-
-    pub fn addConversation(self: MemoryStore, records: []const types.L0Record, iso: types.IsolationContext) !void {
-        return self.vtable.add_conversation(self.ctx, records, iso);
-    }
-
-    pub fn queryConversation(self: MemoryStore, allocator: std.mem.Allocator, filter: types.L0QueryFilter, iso: types.IsolationContext) ![]types.L0Record {
-        return self.vtable.query_conversation(self.ctx, allocator, filter, iso);
-    }
-
-    pub fn searchConversation(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
-        return self.vtable.search_conversation(self.ctx, allocator, query, top_k, iso);
     }
 
     pub fn upsertL1(self: MemoryStore, record: types.L1Record, embedding: ?[]const f32, iso: types.IsolationContext) !bool {

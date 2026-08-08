@@ -79,26 +79,6 @@ pub const IsolationContext = struct {
 };
 
 // ============================
-// L0 — Raw Conversations
-// ============================
-
-/// A raw conversation message captured directly from the agent loop.
-/// No LLM processing — just a verbatim record of what was said.
-pub const L0Record = struct {
-    id: []const u8,
-    session_key: []const u8,
-    session_id: []const u8,
-    role: []const u8, // "user" | "assistant" | "tool"
-    message_text: []const u8,
-    recorded_at: []const u8, // ISO 8601
-    timestamp: i64, // epoch ms
-    team_id: []const u8 = "default",
-    user_id: []const u8 = "default",
-    agent_id: []const u8 = "default",
-    task_id: []const u8 = "",
-};
-
-// ============================
 // L1 — Structured Memories
 // ============================
 
@@ -224,17 +204,6 @@ pub const ScenarioFile = struct {
 // ============================
 // Query Filters
 // ============================
-
-/// Filter for querying L0 conversations.
-pub const L0QueryFilter = struct {
-    session_id: ?[]const u8 = null,
-    time_start_ms: ?i64 = null,
-    time_end_ms: ?i64 = null,
-    /// Only return messages with recorded_at strictly after this ISO timestamp.
-    updated_after: ?[]const u8 = null,
-    limit: u32 = 100,
-    offset: u32 = 0,
-};
 
 /// Filter for querying L1 records.
 pub const L1QueryFilter = struct {
