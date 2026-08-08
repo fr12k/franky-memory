@@ -97,6 +97,12 @@ pub const MemoryContext = struct {
     pub fn recall(self: *MemoryContext, allocator: std.mem.Allocator, query: []const u8, top_k: u32) !types.RecallResult {
         return self.store.recall(allocator, query, top_k, self.iso);
     }
+
+    /// Recall with a maximum character budget for prompt injection.
+    /// A budget of zero means unlimited.
+    pub fn recallWithBudget(self: *MemoryContext, allocator: std.mem.Allocator, query: []const u8, top_k: u32, max_chars: usize) !types.RecallResult {
+        return self.store.recallWithBudget(allocator, query, top_k, self.iso, max_chars);
+    }
 };
 
 // ============================
@@ -119,6 +125,7 @@ pub const SqliteStoreVTable = store_mod.MemoryStore.VTable{
     .write_scenario = vtableWriteScenario,
     .list_scenarios = vtableListScenarios,
     .recall = vtableRecall,
+    .recall_with_budget = vtableRecallWithBudget,
     .get_checkpoint = vtableGetCheckpoint,
     .set_checkpoint = vtableSetCheckpoint,
 };
@@ -186,6 +193,11 @@ fn vtableListScenarios(ctx: *anyopaque, allocator: std.mem.Allocator, path_prefi
 fn vtableRecall(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
     return self.recall(allocator, query, top_k, iso);
+}
+
+fn vtableRecallWithBudget(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext, max_chars: usize) !types.RecallResult {
+    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
+    return self.recallWithBudget(allocator, query, top_k, iso, max_chars);
 }
 
 fn vtableGetCheckpoint(ctx: *anyopaque, allocator: std.mem.Allocator) !types.Checkpoint {
@@ -313,6 +325,35 @@ test "MemoryContext save + search round-trip" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("User prefers PostgreSQL over MySQL", results[0].content);
     try std.testing.expectEqual(types.MemoryType.persona, results[0].type);
+}
+
+test "MemoryContext recallWithBudget delegates through vtable" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const tmp_dir = "/tmp/agent-memory-ctx-budget-test";
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
+
+    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/memory.db", .{tmp_dir}, 0);
+    defer allocator.free(db_path);
+
+    var sqlite = try sqlite_store.SqliteStore.init(allocator, io, db_path, tmp_dir);
+    defer sqlite.deinit();
+
+    var mem_ctx = MemoryContext{
+        .store = .{ .ctx = @ptrCast(&sqlite), .vtable = &SqliteStoreVTable },
+        .iso = .{},
+    };
+
+    try sqlite.writeCore("short persona", .{});
+    var result = try mem_ctx.recallWithBudget(allocator, "test query", 5, 20);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.persona != null);
+    try std.testing.expect(result.total_chars <= 20);
 }
 
 test "MemoryContext recall returns empty on fresh store" {
