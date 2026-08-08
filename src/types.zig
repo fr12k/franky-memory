@@ -173,8 +173,6 @@ pub const StoreCapabilities = struct {
 pub const RecallResult = struct {
     /// L3 persona content (markdown), or null if no persona file exists.
     persona: ?[]const u8 = null,
-    /// L2 scenario files relevant to the query.
-    scenario_files: []ScenarioFile = &.{},
     /// L1 hybrid search hits (vector + BM25 + RRF).
     l1_results: []SearchResult = &.{},
     /// Total character count of all content (for budget capping).
@@ -182,22 +180,8 @@ pub const RecallResult = struct {
 
     pub fn deinit(self: *RecallResult, allocator: std.mem.Allocator) void {
         if (self.persona) |p| allocator.free(p);
-        for (self.scenario_files) |f| f.deinit(allocator);
-        if (self.scenario_files.len > 0) allocator.free(self.scenario_files);
         for (self.l1_results) |r| r.deinit(allocator);
         if (self.l1_results.len > 0) allocator.free(self.l1_results);
-    }
-};
-
-/// An L2 scenario markdown file.
-pub const ScenarioFile = struct {
-    path: []const u8,
-    content: []const u8,
-    version: u32,
-
-    pub fn deinit(self: ScenarioFile, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        allocator.free(self.content);
     }
 };
 

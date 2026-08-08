@@ -26,7 +26,6 @@ pub const L1Record = types.L1Record;
 pub const SearchResult = types.SearchResult;
 pub const StoreCapabilities = types.StoreCapabilities;
 pub const RecallResult = types.RecallResult;
-pub const ScenarioFile = types.ScenarioFile;
 pub const L1QueryFilter = types.L1QueryFilter;
 pub const Checkpoint = types.Checkpoint;
 pub const ExtractionResult = types.ExtractionResult;

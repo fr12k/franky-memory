@@ -31,7 +31,7 @@ pub const MemoryStore = struct {
             iso: types.IsolationContext,
         ) anyerror![]types.SearchResult,
 
-        // L2/L3
+        // L3 persona
         read_core: *const fn (
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
@@ -43,27 +43,6 @@ pub const MemoryStore = struct {
             content: []const u8,
             iso: types.IsolationContext,
         ) anyerror!void,
-
-        read_scenario: *const fn (
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            path: []const u8,
-            iso: types.IsolationContext,
-        ) anyerror!?types.ScenarioFile,
-
-        write_scenario: *const fn (
-            ctx: *anyopaque,
-            path: []const u8,
-            content: []const u8,
-            iso: types.IsolationContext,
-        ) anyerror!void,
-
-        list_scenarios: *const fn (
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            path_prefix: ?[]const u8,
-            iso: types.IsolationContext,
-        ) anyerror![]types.ScenarioFile,
 
         // Recall
         recall: *const fn (
@@ -110,18 +89,6 @@ pub const MemoryStore = struct {
 
     pub fn writeCore(self: MemoryStore, content: []const u8, iso: types.IsolationContext) !void {
         return self.vtable.write_core(self.ctx, content, iso);
-    }
-
-    pub fn readScenario(self: MemoryStore, allocator: std.mem.Allocator, path: []const u8, iso: types.IsolationContext) !?types.ScenarioFile {
-        return self.vtable.read_scenario(self.ctx, allocator, path, iso);
-    }
-
-    pub fn writeScenario(self: MemoryStore, path: []const u8, content: []const u8, iso: types.IsolationContext) !void {
-        return self.vtable.write_scenario(self.ctx, path, content, iso);
-    }
-
-    pub fn listScenarios(self: MemoryStore, allocator: std.mem.Allocator, path_prefix: ?[]const u8, iso: types.IsolationContext) ![]types.ScenarioFile {
-        return self.vtable.list_scenarios(self.ctx, allocator, path_prefix, iso);
     }
 
     pub fn recall(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {

@@ -1,14 +1,14 @@
 //! SQLite-based embedded memory store.
 //!
 //! Implements the `MemoryStore` vtable using SQLite + FTS5 for L1
-//! storage and the filesystem for L2/L3 markdown files.
+//! storage and the filesystem for L3 persona markdown file.
 //!
 //! Design (ported from TencentDB Agent Memory's `sqlite.ts`):
 //! - WAL mode for concurrent read performance.
 //! - FTS5 for full-text keyword search (BM25-ranked).
 //! - L1 table + FTS5 virtual table with triggers to keep them in sync.
 //! - Optional vector embeddings (brute-force cosine — see vector.zig).
-//! - L2/L3 stored as markdown files under `data_dir`.
+//! - L3 persona stored as markdown file under `data_dir`.
 //! - Pipeline checkpoint in a SQLite table.
 
 const std = @import("std");
@@ -22,67 +22,6 @@ const context = @import("../context.zig");
 const TAG = "[agent-memory]";
 
 // ============================
-// Tokenizer helpers (shared by scenario relevance ranking)
-// ============================
-
-/// Split text into lowercase alphanumeric tokens. Caller owns each slice.
-fn tokenizeLower(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
-    var start: ?usize = null;
-    for (text, 0..) |c, i| {
-        const is_alnum = std.ascii.isAlphanumeric(c);
-        if (is_alnum and start == null) start = i;
-        if (!is_alnum and start != null) {
-            const lower = try std.ascii.allocLowerString(allocator, text[start.?..i]);
-            try out.append(allocator, lower);
-            start = null;
-        }
-    }
-    if (start != null) {
-        const lower = try std.ascii.allocLowerString(allocator, text[start.?..]);
-        try out.append(allocator, lower);
-    }
-}
-
-/// Score a scenario file against a query by token overlap.
-/// Path tokens are weighted higher than content tokens (titles are more
-/// discriminative than body text). Returns 0 if no overlap.
-fn scenarioRelevance(query_tokens: []const []const u8, path: []const u8, content: []const u8, allocator: std.mem.Allocator) !f32 {
-    if (query_tokens.len == 0) return 0;
-
-    var path_toks: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (path_toks.items) |t| allocator.free(t);
-        path_toks.deinit(allocator);
-    }
-    try tokenizeLower(allocator, path, &path_toks);
-
-    var content_toks: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (content_toks.items) |t| allocator.free(t);
-        content_toks.deinit(allocator);
-    }
-    try tokenizeLower(allocator, content, &content_toks);
-
-    var score: f32 = 0;
-    for (query_tokens) |qt| {
-        // Path hits count double (title is more informative).
-        for (path_toks.items) |pt| {
-            if (std.mem.eql(u8, qt, pt)) {
-                score += 2.0;
-                break;
-            }
-        }
-        for (content_toks.items) |ct| {
-            if (std.mem.eql(u8, qt, ct)) {
-                score += 1.0;
-                break;
-            }
-        }
-    }
-    return score;
-}
-
-// ============================
 // Store
 // ============================
 
@@ -94,9 +33,9 @@ pub const SqliteStore = struct {
     capabilities: types.StoreCapabilities,
     degraded: bool = false,
 
-    /// Open (or create) a memory store at `db_path` with L2/L3 files under `data_dir`.
+    /// Open (or create) a memory store at `db_path` with L3 persona under `data_dir`.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: [:0]const u8, data_dir: []const u8) !SqliteStore {
-        // Ensure data_dir exists for L2/L3 markdown files.
+        // Ensure data_dir exists for the L3 persona file.
         std.Io.Dir.cwd().createDirPath(io, data_dir) catch |e| switch (e) {
             error.PathAlreadyExists => {},
             else => return e,
@@ -434,7 +373,7 @@ pub const SqliteStore = struct {
     }
 
     // ============================
-    // L2/L3 — Markdown Files
+    // L3 — Persona File
     // ============================
 
     /// Read the L3 persona file.
@@ -471,157 +410,6 @@ pub const SqliteStore = struct {
         try file.writeStreamingAll(self.io, content);
     }
 
-    /// Read an L2 scenario file by path (relative to data_dir).
-    pub fn readScenario(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        path: []const u8,
-        iso: types.IsolationContext,
-    ) !?types.ScenarioFile {
-        _ = iso;
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/scene_blocks/{s}", .{ self.data_dir, path });
-        defer allocator.free(full_path);
-
-        const cwd = std.Io.Dir.cwd();
-        const file = cwd.openFile(self.io, full_path, .{}) catch |e| switch (e) {
-            error.FileNotFound => return null,
-            else => return e,
-        };
-        defer file.close(self.io);
-
-        const stat = try file.stat(self.io);
-        const content = try allocator.alloc(u8, @intCast(stat.size));
-        _ = file.readPositionalAll(self.io, content, 0) catch |e| {
-            allocator.free(content);
-            return e;
-        };
-
-        return .{
-            .path = try allocator.dupe(u8, path),
-            .content = content,
-            .version = 1,
-        };
-    }
-
-    /// Write an L2 scenario file.
-    pub fn writeScenario(
-        self: *SqliteStore,
-        path: []const u8,
-        content: []const u8,
-        iso: types.IsolationContext,
-    ) !void {
-        _ = iso;
-        const dir_path = try std.fmt.allocPrint(self.allocator, "{s}/scene_blocks", .{self.data_dir});
-        defer self.allocator.free(dir_path);
-
-        const cwd = std.Io.Dir.cwd();
-        cwd.createDirPath(self.io, dir_path) catch |e| switch (e) {
-            error.PathAlreadyExists => {},
-            else => return e,
-        };
-
-        const full_path = try std.fmt.allocPrint(self.allocator, "{s}/scene_blocks/{s}", .{ self.data_dir, path });
-        defer self.allocator.free(full_path);
-
-        const file = try cwd.createFile(self.io, full_path, .{});
-        defer file.close(self.io);
-        try file.writeStreamingAll(self.io, content);
-    }
-
-    /// List L2 scenario files.
-    pub fn listScenarios(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        path_prefix: ?[]const u8,
-        iso: types.IsolationContext,
-    ) ![]types.ScenarioFile {
-        _ = iso;
-        const dir_path = try std.fmt.allocPrint(allocator, "{s}/scene_blocks", .{self.data_dir});
-        defer allocator.free(dir_path);
-
-        const cwd = std.Io.Dir.cwd();
-        var dir = cwd.openDir(self.io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
-            error.FileNotFound => return &.{},
-            else => return e,
-        };
-        defer dir.close(self.io);
-
-        var results: std.ArrayList(types.ScenarioFile) = .empty;
-        defer results.deinit(allocator);
-        errdefer {
-            for (results.items) |f| f.deinit(allocator);
-        }
-
-        var iter = dir.iterate();
-        while (try iter.next(self.io)) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
-
-            // Apply prefix filtering if provided.
-            if (path_prefix) |prefix| {
-                if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
-            }
-
-            const content = self.readScenario(allocator, entry.name, .{}) catch continue;
-            if (content) |c| {
-                try results.append(allocator, c);
-            }
-        }
-
-        return try results.toOwnedSlice(allocator);
-    }
-
-    /// List L2 scenario files ranked by relevance to a query.
-    /// Scenario path tokens are weighted double vs content tokens.
-    /// Returns scenarios sorted by relevance score descending, with
-    /// zero-scoring scenarios (no token overlap) appended last.
-    /// When `top_n` > 0, only the top-N scoring scenarios are returned.
-    /// Caller owns the returned slice and each file's strings.
-    pub fn recallScenarios(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        query: []const u8,
-        top_n: usize,
-        iso: types.IsolationContext,
-    ) ![]types.ScenarioFile {
-        const all = try self.listScenarios(allocator, null, iso);
-        if (all.len == 0) return &.{};
-        if (query.len == 0 or top_n == 0) return all;
-
-        // Tokenize the query once.
-        var query_toks: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (query_toks.items) |t| allocator.free(t);
-            query_toks.deinit(allocator);
-        }
-        try tokenizeLower(allocator, query, &query_toks);
-
-        // Score each scenario.
-        const Scored = struct { file: types.ScenarioFile, score: f32 };
-        var scored = try allocator.alloc(Scored, all.len);
-        defer allocator.free(scored);
-        for (all, 0..) |f, i| {
-            const s = try scenarioRelevance(query_toks.items, f.path, f.content, allocator);
-            scored[i] = .{ .file = f, .score = s };
-        }
-
-        // Stable sort by score descending (zero-scorers sink to the end).
-        std.sort.block(Scored, scored, {}, struct {
-            fn lt(_: void, a: Scored, b: Scored) bool {
-                return a.score > b.score;
-            }
-        }.lt);
-
-        const keep = @min(top_n, all.len);
-        var result = try allocator.alloc(types.ScenarioFile, keep);
-        for (scored[0..keep], 0..) |s, i| {
-            result[i] = s.file;
-        }
-        // Free the dropped scenarios (the ones beyond keep).
-        for (scored[keep..]) |s| s.file.deinit(allocator);
-        return result;
-    }
-
     // ============================
     // Recall
     // ============================
@@ -641,7 +429,7 @@ pub const SqliteStore = struct {
 
     /// Recall with character budget capping. When `max_chars` > 0, the result
     /// is truncated to fit within the budget. Priority: L3 persona always included,
-    /// then L1 results (most relevant first), then L2 scenarios. Items that don't
+    /// then L1 results (most relevant first). Items that don't
     /// fit are dropped entirely (not partially truncated).
     /// Use `max_chars = 0` for unlimited (same as recall()).
     pub fn recallWithBudget(
@@ -655,9 +443,6 @@ pub const SqliteStore = struct {
         // L3 persona — always included (if exists).
         const persona = try self.readCore(allocator, iso);
 
-        // L2 scenarios ranked by relevance to the query.
-        const all_scenarios = try self.recallScenarios(allocator, query, 0, iso);
-
         // L1 hybrid search.
         const all_l1 = try self.searchL1Hybrid(allocator, query, top_k, iso, null);
 
@@ -665,17 +450,15 @@ pub const SqliteStore = struct {
         if (max_chars == 0) {
             var total_chars: usize = 0;
             if (persona) |p| total_chars += p.len;
-            for (all_scenarios) |s| total_chars += s.content.len;
             for (all_l1) |r| total_chars += r.content.len;
             return .{
                 .persona = persona,
-                .scenario_files = all_scenarios,
                 .l1_results = all_l1,
                 .total_chars = total_chars,
             };
         }
 
-        // Budget capping: persona first, then L1 (most relevant), then L2.
+        // Budget capping: persona first, then L1 (most relevant).
         var remaining = max_chars;
         var total_chars: usize = 0;
 
@@ -711,26 +494,8 @@ pub const SqliteStore = struct {
             capped_l1 = try allocator.realloc(all_l1, l1_count);
         }
 
-        // L2 scenarios.
-        var capped_scenarios: []types.ScenarioFile = all_scenarios;
-        var scenario_count: usize = 0;
-        for (all_scenarios) |s| {
-            if (s.content.len <= remaining) {
-                remaining -= s.content.len;
-                total_chars += s.content.len;
-                scenario_count += 1;
-            } else {
-                break;
-            }
-        }
-        if (scenario_count < all_scenarios.len) {
-            for (all_scenarios[scenario_count..]) |s| s.deinit(allocator);
-            capped_scenarios = try allocator.realloc(all_scenarios, scenario_count);
-        }
-
         return .{
             .persona = capped_persona,
-            .scenario_files = capped_scenarios,
             .l1_results = capped_l1,
             .total_chars = total_chars,
         };
