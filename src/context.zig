@@ -103,6 +103,59 @@ pub const MemoryContext = struct {
     pub fn recallWithBudget(self: *MemoryContext, allocator: std.mem.Allocator, query: []const u8, top_k: u32, max_chars: usize) !types.RecallResult {
         return self.store.recallWithBudget(allocator, query, top_k, self.iso, max_chars);
     }
+
+    /// Save a memory to L1 with dedup.
+    ///
+    /// Before inserting, searches L1 for existing records with the same
+    /// `scene_name` whose content overlaps the new content on at least one
+    /// non-trivial token. If a near-duplicate is found, the new memory is
+    /// skipped and the decision (`.skip`) is returned. Otherwise the memory
+    /// is stored via `save()` and `.store` is returned.
+    pub fn saveWithDedup(
+        self: *MemoryContext,
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        mem_type: types.MemoryType,
+        priority: f32,
+        scene_name: []const u8,
+    ) !types.DedupDecision {
+        // Collect candidate records by searching for each significant token.
+        // Because FTS5 ANDs multiple terms, we query once per token and
+        // union the results so a single shared keyword surfaces a candidate.
+        var toks: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (toks.items) |t| allocator.free(t);
+            toks.deinit(allocator);
+        }
+        tokenizeInto(allocator, content, &toks);
+
+        for (toks.items) |tok| {
+            const hits = try self.store.searchL1(allocator, tok, 3, self.iso);
+            var found_dup: ?[]u8 = null;
+            var dup_idx: ?usize = null;
+            for (hits, 0..) |h, i| {
+                // Dedup only within the same scene and with token overlap.
+                if (scene_name.len == 0 or std.mem.eql(u8, h.scene_name, scene_name)) {
+                    if (tokenOverlap(content, h.content) >= 1) {
+                        dup_idx = i;
+                        break;
+                    }
+                }
+            }
+            if (dup_idx) |i| {
+                found_dup = try allocator.dupe(u8, hits[i].record_id);
+            }
+            for (hits) |h| h.deinit(allocator);
+            allocator.free(hits);
+            if (found_dup) |id| {
+                return .{ .action = .skip, .existing_record_id = id };
+            }
+        }
+
+        const stored = try self.save(allocator, content, mem_type, priority, scene_name);
+        _ = stored;
+        return .{ .action = .store };
+    }
 };
 
 // ============================
@@ -259,6 +312,65 @@ fn nowMillisStr(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{nowMillis()});
 }
 
+/// Count of shared lowercase tokens between two texts (stop-words excluded).
+/// Used by dedup to detect near-duplicate memories.
+fn tokenOverlap(a: []const u8, b: []const u8) usize {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var a_toks: std.ArrayList([]const u8) = .empty;
+    defer a_toks.deinit(aa);
+    tokenizeInto(aa, a, &a_toks);
+
+    var b_toks: std.ArrayList([]const u8) = .empty;
+    defer b_toks.deinit(aa);
+    tokenizeInto(aa, b, &b_toks);
+
+    var overlap: usize = 0;
+    for (a_toks.items) |at| {
+        for (b_toks.items) |bt| {
+            if (std.mem.eql(u8, at, bt)) {
+                overlap += 1;
+                break;
+            }
+        }
+    }
+    return overlap;
+}
+
+/// Split text into lowercase alphanumeric tokens, skipping stop-words.
+/// Appends owned tokens to `out` (allocated via `allocator`).
+fn tokenizeInto(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) void {
+    const stop = [_][]const u8{ "the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "is", "are", "was", "with", "user" };
+    var start: ?usize = null;
+    for (text, 0..) |c, i| {
+        const is_alnum = std.ascii.isAlphanumeric(c);
+        if (is_alnum and start == null) start = i;
+        if (!is_alnum and start != null) {
+            appendToken(allocator, text[start.?..i], out, &stop);
+            start = null;
+        }
+    }
+    if (start != null) {
+        appendToken(allocator, text[start.?..], out, &stop);
+    }
+}
+
+fn appendToken(allocator: std.mem.Allocator, raw: []const u8, out: *std.ArrayList([]const u8), stop: []const []const u8) void {
+    const lower = std.ascii.allocLowerString(allocator, raw) catch return;
+    for (stop) |s| {
+        if (std.mem.eql(u8, lower, s)) {
+            allocator.free(lower);
+            return;
+        }
+    }
+    out.append(allocator, lower) catch {
+        allocator.free(lower);
+        return;
+    };
+}
+
 // ============================
 // Tests
 // ============================
@@ -385,4 +497,82 @@ test "MemoryContext recall returns empty on fresh store" {
     try std.testing.expectEqual(@as(usize, 0), result.scenario_files.len);
     try std.testing.expectEqual(@as(usize, 0), result.l1_results.len);
     try std.testing.expectEqual(@as(usize, 0), result.total_chars);
+}
+test "MemoryContext saveWithDedup skips near-duplicate in same scene" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const tmp_dir = "/tmp/agent-memory-ctx-dedup-test";
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
+
+    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/memory.db", .{tmp_dir}, 0);
+    defer allocator.free(db_path);
+
+    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path, tmp_dir);
+    defer store.deinit();
+
+    var mem_ctx = MemoryContext{
+        .store = .{ .ctx = @ptrCast(&store), .vtable = &SqliteStoreVTable },
+        .iso = .{ .session_id = "dedup-session" },
+    };
+
+    // First save — should store.
+    const d1 = try mem_ctx.saveWithDedup(allocator, "User prefers PostgreSQL for their database", .persona, 80, "db");
+    try std.testing.expectEqual(types.DedupAction.store, d1.action);
+
+    // Near-duplicate, same scene — should skip.
+    const d2 = try mem_ctx.saveWithDedup(allocator, "User likes using PostgreSQL for database", .persona, 80, "db");
+    try std.testing.expectEqual(types.DedupAction.skip, d2.action);
+    if (d2.existing_record_id) |id| allocator.free(id);
+
+    // Only one record persisted.
+    const results = try mem_ctx.search(allocator, "PostgreSQL", 10);
+    defer {
+        for (results) |r| r.deinit(allocator);
+        allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "MemoryContext saveWithDedup stores distinct scenes and distinct content" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const tmp_dir = "/tmp/agent-memory-ctx-dedup-test2";
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
+
+    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/memory.db", .{tmp_dir}, 0);
+    defer allocator.free(db_path);
+
+    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path, tmp_dir);
+    defer store.deinit();
+
+    var mem_ctx = MemoryContext{
+        .store = .{ .ctx = @ptrCast(&store), .vtable = &SqliteStoreVTable },
+        .iso = .{ .session_id = "dedup-session" },
+    };
+
+    const d1 = try mem_ctx.saveWithDedup(allocator, "User prefers PostgreSQL for their database", .persona, 80, "db");
+    try std.testing.expectEqual(types.DedupAction.store, d1.action);
+
+    // Different scene — should store.
+    const d2 = try mem_ctx.saveWithDedup(allocator, "User likes dark mode in their editor", .persona, 60, "ui");
+    try std.testing.expectEqual(types.DedupAction.store, d2.action);
+
+    // Same scene but completely different content — should store.
+    const d3 = try mem_ctx.saveWithDedup(allocator, "User uses nvim for editing", .persona, 55, "db");
+    try std.testing.expectEqual(types.DedupAction.store, d3.action);
+
+    const results = try mem_ctx.search(allocator, "User", 10);
+    defer {
+        for (results) |r| r.deinit(allocator);
+        allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
 }
