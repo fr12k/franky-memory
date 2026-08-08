@@ -96,6 +96,15 @@ pub const MemoryStore = struct {
             iso: types.IsolationContext,
         ) anyerror!types.RecallResult,
 
+        recall_with_budget: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            query: []const u8,
+            top_k: u32,
+            iso: types.IsolationContext,
+            max_chars: usize,
+        ) anyerror!types.RecallResult,
+
         // Checkpoint
         get_checkpoint: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!types.Checkpoint,
         set_checkpoint: *const fn (ctx: *anyopaque, checkpoint: types.Checkpoint) anyerror!void,
@@ -151,6 +160,10 @@ pub const MemoryStore = struct {
 
     pub fn recall(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
         return self.vtable.recall(self.ctx, allocator, query, top_k, iso);
+    }
+
+    pub fn recallWithBudget(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext, max_chars: usize) !types.RecallResult {
+        return self.vtable.recall_with_budget(self.ctx, allocator, query, top_k, iso, max_chars);
     }
 
     pub fn getCheckpoint(self: MemoryStore, allocator: std.mem.Allocator) !types.Checkpoint {
