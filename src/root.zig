@@ -3,7 +3,7 @@
 //! A Zig implementation of the "Database Memory" concept from TencentDB
 //! Agent Memory (https://github.com/TencentCloud/TencentDB-Agent-Memory).
 //!
-//! Provides layered persistent memory (L1–L3) backed by SQLite + FTS5,
+//! Provides persistent L1 memory (facts) backed by SQLite + FTS5,
 //! designed to be linked into an LLM harness (like franky) as a package
 //! dependency.
 //!

@@ -1,14 +1,13 @@
 //! SQLite-based embedded memory store.
 //!
 //! Implements the `MemoryStore` vtable using SQLite + FTS5 for L1
-//! storage and the filesystem for L3 persona markdown file.
+//! storage.
 //!
 //! Design (ported from TencentDB Agent Memory's `sqlite.ts`):
 //! - WAL mode for concurrent read performance.
 //! - FTS5 for full-text keyword search (BM25-ranked).
 //! - L1 table + FTS5 virtual table with triggers to keep them in sync.
 //! - Optional vector embeddings (brute-force cosine — see vector.zig).
-//! - L3 persona stored as markdown file under `data_dir`.
 //! - Pipeline checkpoint in a SQLite table.
 
 const std = @import("std");
@@ -29,18 +28,11 @@ pub const SqliteStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     db: sqlite.Db,
-    data_dir: []const u8,
     capabilities: types.StoreCapabilities,
     degraded: bool = false,
 
-    /// Open (or create) a memory store at `db_path` with L3 persona under `data_dir`.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: [:0]const u8, data_dir: []const u8) !SqliteStore {
-        // Ensure data_dir exists for the L3 persona file.
-        std.Io.Dir.cwd().createDirPath(io, data_dir) catch |e| switch (e) {
-            error.PathAlreadyExists => {},
-            else => return e,
-        };
-
+    /// Open (or create) a memory store at `db_path`.
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: [:0]const u8) !SqliteStore {
         var db = try sqlite.Db.open(db_path);
         errdefer db.close();
 
@@ -65,14 +57,12 @@ pub const SqliteStore = struct {
             .allocator = allocator,
             .io = io,
             .db = db,
-            .data_dir = try allocator.dupe(u8, data_dir),
             .capabilities = caps,
         };
     }
 
     pub fn deinit(self: *SqliteStore) void {
         self.db.close();
-        self.allocator.free(self.data_dir);
     }
 
     /// Wrap this store in a `MemoryStore` vtable for use with `MemoryContext`.
@@ -373,49 +363,11 @@ pub const SqliteStore = struct {
     }
 
     // ============================
-    // L3 — Persona File
-    // ============================
-
-    /// Read the L3 persona file.
-    pub fn readCore(self: *SqliteStore, allocator: std.mem.Allocator, iso: types.IsolationContext) !?[]u8 {
-        _ = iso; // single-user mode: one persona per data_dir
-        const path = try std.fmt.allocPrint(allocator, "{s}/persona.md", .{self.data_dir});
-        defer allocator.free(path);
-
-        const cwd = std.Io.Dir.cwd();
-        const file = cwd.openFile(self.io, path, .{}) catch |e| switch (e) {
-            error.FileNotFound => return null,
-            else => return e,
-        };
-        defer file.close(self.io);
-
-        const stat = try file.stat(self.io);
-        const content = try allocator.alloc(u8, @intCast(stat.size));
-        _ = file.readPositionalAll(self.io, content, 0) catch |e| {
-            allocator.free(content);
-            return e;
-        };
-        return content;
-    }
-
-    /// Write the L3 persona file.
-    pub fn writeCore(self: *SqliteStore, content: []const u8, iso: types.IsolationContext) !void {
-        _ = iso;
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/persona.md", .{self.data_dir});
-        defer self.allocator.free(path);
-
-        const cwd = std.Io.Dir.cwd();
-        const file = try cwd.createFile(self.io, path, .{});
-        defer file.close(self.io);
-        try file.writeStreamingAll(self.io, content);
-    }
-
-    // ============================
     // Recall
     // ============================
 
     /// The main entry point for prompt injection.
-    /// Searches L1 (hybrid), reads L2/L3, and returns a bounded RecallResult.
+    /// Searches L1 (hybrid) and returns a bounded RecallResult.
     /// No character budget capping — use recallWithBudget for that.
     pub fn recall(
         self: *SqliteStore,
@@ -428,10 +380,9 @@ pub const SqliteStore = struct {
     }
 
     /// Recall with character budget capping. When `max_chars` > 0, the result
-    /// is truncated to fit within the budget. Priority: L3 persona always included,
-    /// then L1 results (most relevant first). Items that don't
-    /// fit are dropped entirely (not partially truncated).
-    /// Use `max_chars = 0` for unlimited (same as recall()).
+    /// is truncated to fit within the budget. L1 results are included most
+    /// relevant first; items that don't fit are dropped entirely (not
+    /// partially truncated). Use `max_chars = 0` for unlimited (same as recall()).
     pub fn recallWithBudget(
         self: *SqliteStore,
         allocator: std.mem.Allocator,
@@ -440,42 +391,23 @@ pub const SqliteStore = struct {
         iso: types.IsolationContext,
         max_chars: usize,
     ) !types.RecallResult {
-        // L3 persona — always included (if exists).
-        const persona = try self.readCore(allocator, iso);
-
         // L1 hybrid search.
         const all_l1 = try self.searchL1Hybrid(allocator, query, top_k, iso, null);
 
         // If no budget, return everything.
         if (max_chars == 0) {
             var total_chars: usize = 0;
-            if (persona) |p| total_chars += p.len;
             for (all_l1) |r| total_chars += r.content.len;
             return .{
-                .persona = persona,
                 .l1_results = all_l1,
                 .total_chars = total_chars,
             };
         }
 
-        // Budget capping: persona first, then L1 (most relevant).
+        // Budget capping: L1 results (most relevant first).
         var remaining = max_chars;
         var total_chars: usize = 0;
 
-        // Persona.
-        var capped_persona: ?[]u8 = null;
-        if (persona) |p| {
-            if (p.len <= remaining) {
-                capped_persona = p;
-                remaining -= p.len;
-                total_chars += p.len;
-            } else {
-                // Persona doesn't fit — drop it (and its allocation).
-                allocator.free(p);
-            }
-        }
-
-        // L1 results (already sorted by relevance from searchL1Hybrid).
         var capped_l1: []types.SearchResult = all_l1;
         var l1_count: usize = 0;
         for (all_l1) |r| {
@@ -495,7 +427,6 @@ pub const SqliteStore = struct {
         }
 
         return .{
-            .persona = capped_persona,
             .l1_results = capped_l1,
             .total_chars = total_chars,
         };

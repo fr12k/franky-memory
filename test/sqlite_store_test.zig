@@ -1,7 +1,7 @@
 //! Integration tests for the embedded SQLite memory store.
 //!
 //! These tests create a real temporary SQLite database and exercise
-//! the L1/L2/L3 CRUD + search operations end-to-end.
+//! the L1 CRUD + search operations end-to-end.
 
 const std = @import("std");
 const agent_memory = @import("agent_memory");
@@ -54,7 +54,7 @@ const TestCtx = struct {
         var threaded = makeIo();
         const io = threaded.io();
         const tmp = try makeTempDir(allocator, io);
-        const store = try sqlite_store.SqliteStore.init(allocator, io, tmp.db_path, tmp.dir);
+        const store = try sqlite_store.SqliteStore.init(allocator, io, tmp.db_path);
         return .{
             .allocator = allocator,
             .threaded = threaded,
@@ -235,31 +235,6 @@ test "L1 upsert replaces existing record" {
     try std.testing.expectEqual(@as(usize, 0), old_results.len);
 }
 
-test "L3 persona write + read" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{};
-    const persona_content = "User's name is Alice. Prefers concise answers. Uses PostgreSQL.";
-
-    try ctx.store.writeCore(persona_content, iso);
-
-    const read = try ctx.store.readCore(ctx.allocator, iso);
-    defer if (read) |r| ctx.allocator.free(r);
-
-    try std.testing.expect(read != null);
-    try std.testing.expectEqualStrings(persona_content, read.?);
-}
-
-test "L3 persona read when missing returns null" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{};
-    const read = try ctx.store.readCore(ctx.allocator, iso);
-    try std.testing.expectEqual(@as(?[]u8, null), read);
-}
-
 test "checkpoint set + get round-trip" {
     var ctx = try TestCtx.init();
     defer ctx.deinit();
@@ -288,14 +263,11 @@ test "checkpoint get when empty returns empty" {
     try std.testing.expect(read.last_scene_name == null);
 }
 
-test "recall returns L3 + L2 + L1" {
+test "recall returns L1" {
     var ctx = try TestCtx.init();
     defer ctx.deinit();
 
     const iso = types.IsolationContext{};
-
-    // Write L3.
-    try ctx.store.writeCore("User prefers dark mode.", iso);
 
     // Write L1.
     const l1 = types.L1Record{
@@ -323,10 +295,6 @@ test "recall returns L3 + L2 + L1" {
     // Recall.
     var result = try ctx.store.recall(ctx.allocator, "PostgreSQL", 5, iso);
     defer result.deinit(ctx.allocator);
-
-    // L3 should be present.
-    try std.testing.expect(result.persona != null);
-    try std.testing.expectEqualStrings("User prefers dark mode.", result.persona.?);
 
     // L1 should have 1 hit.
     try std.testing.expectEqual(@as(usize, 1), result.l1_results.len);
@@ -537,9 +505,6 @@ test "recallWithBudget caps total content" {
 
     const iso = types.IsolationContext{};
 
-    // Write L3 persona (10 chars).
-    try ctx.store.writeCore("User likes dark mode.", iso); // 20 chars
-
     // Write L1 records.
     const rec1 = types.L1Record{
         .record_id = "budget-001",
@@ -563,7 +528,7 @@ test "recallWithBudget caps total content" {
     };
     var rec2 = rec1;
     rec2.record_id = "budget-002";
-    rec2.content = "User likes Python programming language"; // 39 chars
+    rec2.content = "User uses PostgreSQL for their Python backend"; // matches query
 
     _ = try ctx.store.upsertL1(rec1, null, iso);
     _ = try ctx.store.upsertL1(rec2, null, iso);
@@ -574,12 +539,10 @@ test "recallWithBudget caps total content" {
     try std.testing.expect(unlimited.total_chars > 0);
     try std.testing.expectEqual(@as(usize, 2), unlimited.l1_results.len);
 
-    // Recall with tight budget (50 chars) — persona (20) + 1 L1 (36) = 56 > 50, so persona + 0 L1.
+    // Recall with tight budget (50 chars) — only enough L1 fits.
     var capped = try ctx.store.recallWithBudget(ctx.allocator, "PostgreSQL", 5, iso, 50);
     defer capped.deinit(ctx.allocator);
     try std.testing.expect(capped.total_chars <= 50);
-    try std.testing.expect(capped.persona != null); // persona always included first
-    // L1 results may be empty if persona alone fills budget.
 }
 
 test "recallWithBudget with zero budget returns everything" {
@@ -587,8 +550,6 @@ test "recallWithBudget with zero budget returns everything" {
     defer ctx.deinit();
 
     const iso = types.IsolationContext{};
-
-    try ctx.store.writeCore("Persona text", iso);
 
     const rec = types.L1Record{
         .record_id = "budget-003",
@@ -614,6 +575,5 @@ test "recallWithBudget with zero budget returns everything" {
 
     var result = try ctx.store.recallWithBudget(ctx.allocator, "memory", 5, iso, 0);
     defer result.deinit(ctx.allocator);
-    try std.testing.expect(result.persona != null);
     try std.testing.expectEqual(@as(usize, 1), result.l1_results.len);
 }

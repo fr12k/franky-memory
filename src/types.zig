@@ -1,6 +1,6 @@
 //! Core type definitions for agent-memory-zig.
 //!
-//! These types define the memory record shapes (L0–L3) and the isolation
+//! These types define the L1 memory record shapes and the isolation
 //! context used to scope multi-tenant data. All types are plain structs;
 //! every value is serializable to JSON.
 
@@ -171,15 +171,12 @@ pub const StoreCapabilities = struct {
 /// The aggregated result of a recall operation — what gets injected
 /// into the system prompt before the next LLM call.
 pub const RecallResult = struct {
-    /// L3 persona content (markdown), or null if no persona file exists.
-    persona: ?[]const u8 = null,
     /// L1 hybrid search hits (vector + BM25 + RRF).
     l1_results: []SearchResult = &.{},
     /// Total character count of all content (for budget capping).
     total_chars: usize = 0,
 
     pub fn deinit(self: *RecallResult, allocator: std.mem.Allocator) void {
-        if (self.persona) |p| allocator.free(p);
         for (self.l1_results) |r| r.deinit(allocator);
         if (self.l1_results.len > 0) allocator.free(self.l1_results);
     }

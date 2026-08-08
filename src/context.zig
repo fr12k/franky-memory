@@ -5,7 +5,7 @@
 //! dependencies on any LLM harness — it's pure agent-memory-zig.
 //!
 //! Usage:
-//!   var store = try agent_memory.SqliteStore.init(allocator, io, db_path, data_dir);
+//!   var store = try agent_memory.SqliteStore.init(allocator, io, db_path);
 //!   defer store.deinit();
 //!   var mem_ctx = agent_memory.MemoryContext{
 //!       .store = store.toMemoryStore(),
@@ -93,7 +93,7 @@ pub const MemoryContext = struct {
     }
 
     /// Recall — the main entry point for system prompt injection.
-    /// Searches L1 + reads L2/L3 and returns a bounded RecallResult.
+    /// Searches L1 and returns a bounded RecallResult.
     pub fn recall(self: *MemoryContext, allocator: std.mem.Allocator, query: []const u8, top_k: u32) !types.RecallResult {
         return self.store.recall(allocator, query, top_k, self.iso);
     }
@@ -116,8 +116,6 @@ pub const SqliteStoreVTable = store_mod.MemoryStore.VTable{
     .capabilities = vtableCapabilities,
     .upsert_l1 = vtableUpsertL1,
     .search_l1 = vtableSearchL1,
-    .read_core = vtableReadCore,
-    .write_core = vtableWriteCore,
     .recall = vtableRecall,
     .recall_with_budget = vtableRecallWithBudget,
     .get_checkpoint = vtableGetCheckpoint,
@@ -142,16 +140,6 @@ fn vtableUpsertL1(ctx: *anyopaque, record: types.L1Record, embedding: ?[]const f
 fn vtableSearchL1(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
     return self.searchL1Hybrid(allocator, query, top_k, iso, null);
-}
-
-fn vtableReadCore(ctx: *anyopaque, allocator: std.mem.Allocator, iso: types.IsolationContext) !?[]u8 {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.readCore(allocator, iso);
-}
-
-fn vtableWriteCore(ctx: *anyopaque, content: []const u8, iso: types.IsolationContext) !void {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.writeCore(content, iso);
 }
 
 fn vtableRecall(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
@@ -240,7 +228,7 @@ test "MemoryContext search returns empty on fresh store" {
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/memory.db", .{tmp_dir}, 0);
     defer allocator.free(db_path);
 
-    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path, tmp_dir);
+    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path);
     defer store.deinit();
 
     var mem_ctx = MemoryContext{
@@ -269,7 +257,7 @@ test "MemoryContext save + search round-trip" {
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/memory.db", .{tmp_dir}, 0);
     defer allocator.free(db_path);
 
-    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path, tmp_dir);
+    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path);
     defer store.deinit();
 
     var mem_ctx = MemoryContext{
@@ -304,7 +292,7 @@ test "MemoryContext recallWithBudget delegates through vtable" {
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/memory.db", .{tmp_dir}, 0);
     defer allocator.free(db_path);
 
-    var sqlite = try sqlite_store.SqliteStore.init(allocator, io, db_path, tmp_dir);
+    var sqlite = try sqlite_store.SqliteStore.init(allocator, io, db_path);
     defer sqlite.deinit();
 
     var mem_ctx = MemoryContext{
@@ -312,11 +300,9 @@ test "MemoryContext recallWithBudget delegates through vtable" {
         .iso = .{},
     };
 
-    try sqlite.writeCore("short persona", .{});
     var result = try mem_ctx.recallWithBudget(allocator, "test query", 5, 20);
     defer result.deinit(allocator);
 
-    try std.testing.expect(result.persona != null);
     try std.testing.expect(result.total_chars <= 20);
 }
 
@@ -333,7 +319,7 @@ test "MemoryContext recall returns empty on fresh store" {
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/memory.db", .{tmp_dir}, 0);
     defer allocator.free(db_path);
 
-    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path, tmp_dir);
+    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path);
     defer store.deinit();
 
     var mem_ctx = MemoryContext{
@@ -344,8 +330,7 @@ test "MemoryContext recall returns empty on fresh store" {
     var result = try mem_ctx.recall(allocator, "test query", 5);
     defer result.deinit(allocator);
 
-    // Fresh store → no persona, no L1 hits.
-    try std.testing.expectEqual(@as(?[]const u8, null), result.persona);
+    // Fresh store → no L1 hits.
     try std.testing.expectEqual(@as(usize, 0), result.l1_results.len);
     try std.testing.expectEqual(@as(usize, 0), result.total_chars);
 }
