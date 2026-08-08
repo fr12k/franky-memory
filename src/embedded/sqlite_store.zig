@@ -22,6 +22,67 @@ const context = @import("../context.zig");
 const TAG = "[agent-memory]";
 
 // ============================
+// Tokenizer helpers (shared by scenario relevance ranking)
+// ============================
+
+/// Split text into lowercase alphanumeric tokens. Caller owns each slice.
+fn tokenizeLower(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var start: ?usize = null;
+    for (text, 0..) |c, i| {
+        const is_alnum = std.ascii.isAlphanumeric(c);
+        if (is_alnum and start == null) start = i;
+        if (!is_alnum and start != null) {
+            const lower = try std.ascii.allocLowerString(allocator, text[start.?..i]);
+            try out.append(allocator, lower);
+            start = null;
+        }
+    }
+    if (start != null) {
+        const lower = try std.ascii.allocLowerString(allocator, text[start.?..]);
+        try out.append(allocator, lower);
+    }
+}
+
+/// Score a scenario file against a query by token overlap.
+/// Path tokens are weighted higher than content tokens (titles are more
+/// discriminative than body text). Returns 0 if no overlap.
+fn scenarioRelevance(query_tokens: []const []const u8, path: []const u8, content: []const u8, allocator: std.mem.Allocator) !f32 {
+    if (query_tokens.len == 0) return 0;
+
+    var path_toks: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (path_toks.items) |t| allocator.free(t);
+        path_toks.deinit(allocator);
+    }
+    try tokenizeLower(allocator, path, &path_toks);
+
+    var content_toks: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (content_toks.items) |t| allocator.free(t);
+        content_toks.deinit(allocator);
+    }
+    try tokenizeLower(allocator, content, &content_toks);
+
+    var score: f32 = 0;
+    for (query_tokens) |qt| {
+        // Path hits count double (title is more informative).
+        for (path_toks.items) |pt| {
+            if (std.mem.eql(u8, qt, pt)) {
+                score += 2.0;
+                break;
+            }
+        }
+        for (content_toks.items) |ct| {
+            if (std.mem.eql(u8, qt, ct)) {
+                score += 1.0;
+                break;
+            }
+        }
+    }
+    return score;
+}
+
+// ============================
 // Store
 // ============================
 
@@ -713,6 +774,57 @@ pub const SqliteStore = struct {
         return try results.toOwnedSlice(allocator);
     }
 
+    /// List L2 scenario files ranked by relevance to a query.
+    /// Scenario path tokens are weighted double vs content tokens.
+    /// Returns scenarios sorted by relevance score descending, with
+    /// zero-scoring scenarios (no token overlap) appended last.
+    /// When `top_n` > 0, only the top-N scoring scenarios are returned.
+    /// Caller owns the returned slice and each file's strings.
+    pub fn recallScenarios(
+        self: *SqliteStore,
+        allocator: std.mem.Allocator,
+        query: []const u8,
+        top_n: usize,
+        iso: types.IsolationContext,
+    ) ![]types.ScenarioFile {
+        const all = try self.listScenarios(allocator, null, iso);
+        if (all.len == 0) return &.{};
+        if (query.len == 0 or top_n == 0) return all;
+
+        // Tokenize the query once.
+        var query_toks: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (query_toks.items) |t| allocator.free(t);
+            query_toks.deinit(allocator);
+        }
+        try tokenizeLower(allocator, query, &query_toks);
+
+        // Score each scenario.
+        const Scored = struct { file: types.ScenarioFile, score: f32 };
+        var scored = try allocator.alloc(Scored, all.len);
+        defer allocator.free(scored);
+        for (all, 0..) |f, i| {
+            const s = try scenarioRelevance(query_toks.items, f.path, f.content, allocator);
+            scored[i] = .{ .file = f, .score = s };
+        }
+
+        // Stable sort by score descending (zero-scorers sink to the end).
+        std.sort.block(Scored, scored, {}, struct {
+            fn lt(_: void, a: Scored, b: Scored) bool {
+                return a.score > b.score;
+            }
+        }.lt);
+
+        const keep = @min(top_n, all.len);
+        var result = try allocator.alloc(types.ScenarioFile, keep);
+        for (scored[0..keep], 0..) |s, i| {
+            result[i] = s.file;
+        }
+        // Free the dropped scenarios (the ones beyond keep).
+        for (scored[keep..]) |s| s.file.deinit(allocator);
+        return result;
+    }
+
     // ============================
     // Recall
     // ============================
@@ -746,8 +858,8 @@ pub const SqliteStore = struct {
         // L3 persona — always included (if exists).
         const persona = try self.readCore(allocator, iso);
 
-        // L2 scenarios (all for now; TODO: filter by relevance).
-        const all_scenarios = try self.listScenarios(allocator, null, iso);
+        // L2 scenarios ranked by relevance to the query.
+        const all_scenarios = try self.recallScenarios(allocator, query, 0, iso);
 
         // L1 hybrid search.
         const all_l1 = try self.searchL1Hybrid(allocator, query, top_k, iso, null);

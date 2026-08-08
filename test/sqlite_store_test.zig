@@ -793,3 +793,62 @@ test "recallWithBudget with zero budget returns everything" {
     try std.testing.expectEqual(@as(usize, 1), result.scenario_files.len);
     try std.testing.expectEqual(@as(usize, 1), result.l1_results.len);
 }
+
+test "recallScenarios ranks by query relevance" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+
+    try ctx.store.writeScenario("podman-setup.md", "How to migrate podman containers", iso);
+    try ctx.store.writeScenario("database.md", "PostgreSQL configuration for storage", iso);
+    try ctx.store.writeScenario("frontend.md", "React component styling", iso);
+
+    // Query about podman — the podman scenario should rank first.
+    const results = try ctx.store.recallScenarios(ctx.allocator, "podman migration", 3, iso);
+    defer {
+        for (results) |f| f.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expect(std.mem.startsWith(u8, results[0].path, "podman"));
+}
+
+test "recallScenarios top_n limits results" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+
+    try ctx.store.writeScenario("podman-setup.md", "How to migrate podman containers", iso);
+    try ctx.store.writeScenario("database.md", "PostgreSQL configuration", iso);
+    try ctx.store.writeScenario("frontend.md", "React component styling", iso);
+
+    // Query about podman, top_n=1 — only the podman scenario returned.
+    const results = try ctx.store.recallScenarios(ctx.allocator, "podman migration", 1, iso);
+    defer {
+        for (results) |f| f.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(std.mem.startsWith(u8, results[0].path, "podman"));
+}
+
+test "recallWithBudget uses ranked scenarios" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+
+    try ctx.store.writeScenario("podman-setup.md", "How to migrate podman containers", iso);
+    try ctx.store.writeScenario("frontend.md", "React component styling unrelated content here", iso);
+
+    var result = try ctx.store.recallWithBudget(ctx.allocator, "podman migration", 5, iso, 0);
+    defer result.deinit(ctx.allocator);
+
+    // The podman scenario should be ranked before the frontend one.
+    try std.testing.expectEqual(@as(usize, 2), result.scenario_files.len);
+    try std.testing.expect(std.mem.startsWith(u8, result.scenario_files[0].path, "podman"));
+}
