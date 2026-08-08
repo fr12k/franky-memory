@@ -3,7 +3,7 @@
 //! A Zig implementation of the "Database Memory" concept from TencentDB
 //! Agent Memory (https://github.com/TencentCloud/TencentDB-Agent-Memory).
 //!
-//! Provides layered persistent memory (L0–L3) backed by SQLite + FTS5,
+//! Provides layered persistent memory (L1–L3) backed by SQLite + FTS5,
 //! designed to be linked into an LLM harness (like franky) as a package
 //! dependency.
 //!
@@ -22,13 +22,10 @@ pub const vector = @import("embedded/vector.zig");
 // Re-export key types at the top level for convenience.
 pub const MemoryType = types.MemoryType;
 pub const IsolationContext = types.IsolationContext;
-pub const L0Record = types.L0Record;
 pub const L1Record = types.L1Record;
 pub const SearchResult = types.SearchResult;
 pub const StoreCapabilities = types.StoreCapabilities;
 pub const RecallResult = types.RecallResult;
-pub const ScenarioFile = types.ScenarioFile;
-pub const L0QueryFilter = types.L0QueryFilter;
 pub const L1QueryFilter = types.L1QueryFilter;
 pub const Checkpoint = types.Checkpoint;
 pub const ExtractionResult = types.ExtractionResult;

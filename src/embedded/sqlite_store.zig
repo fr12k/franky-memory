@@ -1,14 +1,14 @@
 //! SQLite-based embedded memory store.
 //!
-//! Implements the `MemoryStore` vtable using SQLite + FTS5 for L0/L1
-//! storage and the filesystem for L2/L3 markdown files.
+//! Implements the `MemoryStore` vtable using SQLite + FTS5 for L1
+//! storage and the filesystem for L3 persona markdown file.
 //!
 //! Design (ported from TencentDB Agent Memory's `sqlite.ts`):
 //! - WAL mode for concurrent read performance.
 //! - FTS5 for full-text keyword search (BM25-ranked).
-//! - L0/L1 tables + FTS5 virtual tables with triggers to keep them in sync.
+//! - L1 table + FTS5 virtual table with triggers to keep them in sync.
 //! - Optional vector embeddings (brute-force cosine — see vector.zig).
-//! - L2/L3 stored as markdown files under `data_dir`.
+//! - L3 persona stored as markdown file under `data_dir`.
 //! - Pipeline checkpoint in a SQLite table.
 
 const std = @import("std");
@@ -22,67 +22,6 @@ const context = @import("../context.zig");
 const TAG = "[agent-memory]";
 
 // ============================
-// Tokenizer helpers (shared by scenario relevance ranking)
-// ============================
-
-/// Split text into lowercase alphanumeric tokens. Caller owns each slice.
-fn tokenizeLower(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
-    var start: ?usize = null;
-    for (text, 0..) |c, i| {
-        const is_alnum = std.ascii.isAlphanumeric(c);
-        if (is_alnum and start == null) start = i;
-        if (!is_alnum and start != null) {
-            const lower = try std.ascii.allocLowerString(allocator, text[start.?..i]);
-            try out.append(allocator, lower);
-            start = null;
-        }
-    }
-    if (start != null) {
-        const lower = try std.ascii.allocLowerString(allocator, text[start.?..]);
-        try out.append(allocator, lower);
-    }
-}
-
-/// Score a scenario file against a query by token overlap.
-/// Path tokens are weighted higher than content tokens (titles are more
-/// discriminative than body text). Returns 0 if no overlap.
-fn scenarioRelevance(query_tokens: []const []const u8, path: []const u8, content: []const u8, allocator: std.mem.Allocator) !f32 {
-    if (query_tokens.len == 0) return 0;
-
-    var path_toks: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (path_toks.items) |t| allocator.free(t);
-        path_toks.deinit(allocator);
-    }
-    try tokenizeLower(allocator, path, &path_toks);
-
-    var content_toks: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (content_toks.items) |t| allocator.free(t);
-        content_toks.deinit(allocator);
-    }
-    try tokenizeLower(allocator, content, &content_toks);
-
-    var score: f32 = 0;
-    for (query_tokens) |qt| {
-        // Path hits count double (title is more informative).
-        for (path_toks.items) |pt| {
-            if (std.mem.eql(u8, qt, pt)) {
-                score += 2.0;
-                break;
-            }
-        }
-        for (content_toks.items) |ct| {
-            if (std.mem.eql(u8, qt, ct)) {
-                score += 1.0;
-                break;
-            }
-        }
-    }
-    return score;
-}
-
-// ============================
 // Store
 // ============================
 
@@ -94,9 +33,9 @@ pub const SqliteStore = struct {
     capabilities: types.StoreCapabilities,
     degraded: bool = false,
 
-    /// Open (or create) a memory store at `db_path` with L2/L3 files under `data_dir`.
+    /// Open (or create) a memory store at `db_path` with L3 persona under `data_dir`.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: [:0]const u8, data_dir: []const u8) !SqliteStore {
-        // Ensure data_dir exists for L2/L3 markdown files.
+        // Ensure data_dir exists for the L3 persona file.
         std.Io.Dir.cwd().createDirPath(io, data_dir) catch |e| switch (e) {
             error.PathAlreadyExists => {},
             else => return e,
@@ -141,209 +80,6 @@ pub const SqliteStore = struct {
     /// of the returned `MemoryStore`.
     pub fn toMemoryStore(self: *SqliteStore) store.MemoryStore {
         return .{ .ctx = @ptrCast(self), .vtable = &context.SqliteStoreVTable };
-    }
-
-    // ============================
-    // L0 — Raw Conversations
-    // ============================
-
-    /// Insert one or more L0 conversation records.
-    pub fn addConversation(
-        self: *SqliteStore,
-        records: []const types.L0Record,
-        iso: types.IsolationContext,
-    ) !void {
-        // Use a transaction for atomicity.
-        try self.db.exec("BEGIN IMMEDIATE");
-        errdefer self.db.exec("ROLLBACK") catch {};
-
-        const sql =
-            "INSERT INTO l0_conversations " ++
-            "(record_id, session_key, session_id, team_id, user_id, agent_id, task_id, " ++
-            "role, message_text, recorded_at, timestamp) " ++
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-
-        for (records) |r| {
-            stmt.reset();
-            try stmt.bindText(1, r.id);
-            try stmt.bindText(2, r.session_key);
-            try stmt.bindText(3, r.session_id);
-            try stmt.bindText(4, if (r.team_id.len > 0) r.team_id else iso.team_id);
-            try stmt.bindText(5, if (r.user_id.len > 0) r.user_id else iso.user_id);
-            try stmt.bindText(6, if (r.agent_id.len > 0) r.agent_id else iso.agent_id);
-            try stmt.bindText(7, r.task_id);
-            try stmt.bindText(8, r.role);
-            try stmt.bindText(9, r.message_text);
-            try stmt.bindText(10, r.recorded_at);
-            try stmt.bindInt(11, r.timestamp);
-            const step_rc = stmt.step() catch |e| {
-                return e;
-            };
-            _ = step_rc;
-        }
-
-        try self.db.exec("COMMIT");
-    }
-
-    /// Query L0 conversations with filtering.
-    /// Caller owns the returned slice and each record's strings.
-    pub fn queryConversation(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        filter: types.L0QueryFilter,
-        iso: types.IsolationContext,
-    ) ![]types.L0Record {
-        var time_start_ms_val: ?i64 = null;
-        _ = &time_start_ms_val;
-
-        var sql_buf: std.ArrayList(u8) = .empty;
-        defer sql_buf.deinit(allocator);
-        try sql_buf.appendSlice(
-            allocator,
-            "SELECT record_id, session_key, session_id, team_id, user_id, agent_id, task_id, " ++
-                "role, message_text, recorded_at, timestamp FROM l0_conversations WHERE ",
-        );
-        try iso.whereClause(allocator, &sql_buf);
-
-        var params = std.ArrayList([]const u8).empty;
-        defer params.deinit(allocator);
-        try params.append(allocator, iso.team_id);
-        try params.append(allocator, iso.agent_id);
-        try params.append(allocator, iso.user_id);
-
-        // whereClause already added session_id / task_id conditions if present.
-        if (iso.session_id) |sid| {
-            try params.append(allocator, sid);
-        }
-        if (iso.task_id) |tid| {
-            try params.append(allocator, tid);
-        }
-        if (filter.updated_after) |ua| {
-            try sql_buf.appendSlice(allocator, " AND recorded_at > ?");
-            try params.append(allocator, ua);
-        }
-        if (filter.time_start_ms) |ts| {
-            try sql_buf.appendSlice(allocator, " AND timestamp >= ?");
-            // Store the int value to bind after string params.
-            time_start_ms_val = ts;
-        }
-
-        // Order + limit.
-        try sql_buf.appendSlice(allocator, " ORDER BY timestamp ASC");
-        if (filter.limit > 0) {
-            const limit_str = try std.fmt.allocPrint(allocator, " LIMIT {d}", .{filter.limit});
-            defer allocator.free(limit_str);
-            try sql_buf.appendSlice(allocator, limit_str);
-            if (filter.offset > 0) {
-                const offset_str = try std.fmt.allocPrint(allocator, " OFFSET {d}", .{filter.offset});
-                defer allocator.free(offset_str);
-                try sql_buf.appendSlice(allocator, offset_str);
-            }
-        }
-
-        var stmt = try self.db.prepare(sql_buf.items);
-        defer stmt.finalize();
-
-        // Bind string params (1-based index).
-        for (params.items, 1..) |p, i| {
-            try stmt.bindText(@intCast(i), p);
-        }
-
-        // Bind int param for time_start_ms (if any) at the next position.
-        if (time_start_ms_val) |ts| {
-            try stmt.bindInt(@intCast(params.items.len + 1), ts);
-        }
-
-        var results: std.ArrayList(types.L0Record) = .empty;
-        defer results.deinit(allocator);
-        errdefer {
-            for (results.items) |r| {
-                allocator.free(r.id);
-                allocator.free(r.session_key);
-                allocator.free(r.session_id);
-                allocator.free(r.role);
-                allocator.free(r.message_text);
-                allocator.free(r.recorded_at);
-            }
-        }
-
-        while (try stmt.step()) {
-            const record = types.L0Record{
-                .id = try allocator.dupe(u8, stmt.columnText(0)),
-                .session_key = try allocator.dupe(u8, stmt.columnText(1)),
-                .session_id = try allocator.dupe(u8, stmt.columnText(2)),
-                .team_id = try allocator.dupe(u8, stmt.columnText(3)),
-                .user_id = try allocator.dupe(u8, stmt.columnText(4)),
-                .agent_id = try allocator.dupe(u8, stmt.columnText(5)),
-                .task_id = try allocator.dupe(u8, stmt.columnText(6)),
-                .role = try allocator.dupe(u8, stmt.columnText(7)),
-                .message_text = try allocator.dupe(u8, stmt.columnText(8)),
-                .recorded_at = try allocator.dupe(u8, stmt.columnText(9)),
-                .timestamp = stmt.columnInt(10),
-            };
-            try results.append(allocator, record);
-        }
-
-        return try results.toOwnedSlice(allocator);
-    }
-
-    /// FTS5 keyword search on L0 conversations.
-    /// Returns BM25-ranked results.
-    pub fn searchConversationFts(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        query: []const u8,
-        top_k: u32,
-        iso: types.IsolationContext,
-    ) ![]types.SearchResult {
-        if (!self.capabilities.fts_search) return &.{};
-
-        // FTS5 query: escape special characters by quoting.
-        const fts_query = try buildFtsQuery(allocator, query);
-        defer allocator.free(fts_query);
-
-        const sql =
-            "SELECT l0.record_id, l0.message_text, 'episodic' AS type, 50.0 AS priority, " ++
-            "'' AS scene_name, bm25(l0_fts) AS score, l0.session_id, l0.team_id, l0.user_id, l0.agent_id " ++
-            "FROM l0_fts JOIN l0_conversations l0 ON l0_fts.rowid = l0.rowid " ++
-            "WHERE l0_fts MATCH ? AND l0.team_id = ? AND l0.agent_id = ? AND l0.user_id = ? " ++
-            "ORDER BY score LIMIT ?";
-
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-
-        try stmt.bindText(1, fts_query);
-        try stmt.bindText(2, iso.team_id);
-        try stmt.bindText(3, iso.agent_id);
-        try stmt.bindText(4, iso.user_id);
-        try stmt.bindInt(5, @intCast(top_k));
-
-        var results: std.ArrayList(types.SearchResult) = .empty;
-        defer results.deinit(allocator);
-        errdefer {
-            for (results.items) |r| r.deinit(allocator);
-        }
-
-        while (try stmt.step()) {
-            const result = types.SearchResult{
-                .record_id = try allocator.dupe(u8, stmt.columnText(0)),
-                .content = try allocator.dupe(u8, stmt.columnText(1)),
-                .type = .episodic, // L0 doesn't have types; use episodic as default
-                .priority = @floatCast(stmt.columnFloat(3)),
-                .scene_name = try allocator.dupe(u8, stmt.columnText(4)),
-                .score = @floatCast(stmt.columnFloat(5)),
-                .session_id = try allocator.dupe(u8, stmt.columnText(6)),
-                .team_id = try allocator.dupe(u8, stmt.columnText(7)),
-                .user_id = try allocator.dupe(u8, stmt.columnText(8)),
-                .agent_id = try allocator.dupe(u8, stmt.columnText(9)),
-            };
-            try results.append(allocator, result);
-        }
-
-        return try results.toOwnedSlice(allocator);
     }
 
     // ============================
@@ -637,7 +373,7 @@ pub const SqliteStore = struct {
     }
 
     // ============================
-    // L2/L3 — Markdown Files
+    // L3 — Persona File
     // ============================
 
     /// Read the L3 persona file.
@@ -674,157 +410,6 @@ pub const SqliteStore = struct {
         try file.writeStreamingAll(self.io, content);
     }
 
-    /// Read an L2 scenario file by path (relative to data_dir).
-    pub fn readScenario(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        path: []const u8,
-        iso: types.IsolationContext,
-    ) !?types.ScenarioFile {
-        _ = iso;
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/scene_blocks/{s}", .{ self.data_dir, path });
-        defer allocator.free(full_path);
-
-        const cwd = std.Io.Dir.cwd();
-        const file = cwd.openFile(self.io, full_path, .{}) catch |e| switch (e) {
-            error.FileNotFound => return null,
-            else => return e,
-        };
-        defer file.close(self.io);
-
-        const stat = try file.stat(self.io);
-        const content = try allocator.alloc(u8, @intCast(stat.size));
-        _ = file.readPositionalAll(self.io, content, 0) catch |e| {
-            allocator.free(content);
-            return e;
-        };
-
-        return .{
-            .path = try allocator.dupe(u8, path),
-            .content = content,
-            .version = 1,
-        };
-    }
-
-    /// Write an L2 scenario file.
-    pub fn writeScenario(
-        self: *SqliteStore,
-        path: []const u8,
-        content: []const u8,
-        iso: types.IsolationContext,
-    ) !void {
-        _ = iso;
-        const dir_path = try std.fmt.allocPrint(self.allocator, "{s}/scene_blocks", .{self.data_dir});
-        defer self.allocator.free(dir_path);
-
-        const cwd = std.Io.Dir.cwd();
-        cwd.createDirPath(self.io, dir_path) catch |e| switch (e) {
-            error.PathAlreadyExists => {},
-            else => return e,
-        };
-
-        const full_path = try std.fmt.allocPrint(self.allocator, "{s}/scene_blocks/{s}", .{ self.data_dir, path });
-        defer self.allocator.free(full_path);
-
-        const file = try cwd.createFile(self.io, full_path, .{});
-        defer file.close(self.io);
-        try file.writeStreamingAll(self.io, content);
-    }
-
-    /// List L2 scenario files.
-    pub fn listScenarios(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        path_prefix: ?[]const u8,
-        iso: types.IsolationContext,
-    ) ![]types.ScenarioFile {
-        _ = iso;
-        const dir_path = try std.fmt.allocPrint(allocator, "{s}/scene_blocks", .{self.data_dir});
-        defer allocator.free(dir_path);
-
-        const cwd = std.Io.Dir.cwd();
-        var dir = cwd.openDir(self.io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
-            error.FileNotFound => return &.{},
-            else => return e,
-        };
-        defer dir.close(self.io);
-
-        var results: std.ArrayList(types.ScenarioFile) = .empty;
-        defer results.deinit(allocator);
-        errdefer {
-            for (results.items) |f| f.deinit(allocator);
-        }
-
-        var iter = dir.iterate();
-        while (try iter.next(self.io)) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
-
-            // Apply prefix filtering if provided.
-            if (path_prefix) |prefix| {
-                if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
-            }
-
-            const content = self.readScenario(allocator, entry.name, .{}) catch continue;
-            if (content) |c| {
-                try results.append(allocator, c);
-            }
-        }
-
-        return try results.toOwnedSlice(allocator);
-    }
-
-    /// List L2 scenario files ranked by relevance to a query.
-    /// Scenario path tokens are weighted double vs content tokens.
-    /// Returns scenarios sorted by relevance score descending, with
-    /// zero-scoring scenarios (no token overlap) appended last.
-    /// When `top_n` > 0, only the top-N scoring scenarios are returned.
-    /// Caller owns the returned slice and each file's strings.
-    pub fn recallScenarios(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        query: []const u8,
-        top_n: usize,
-        iso: types.IsolationContext,
-    ) ![]types.ScenarioFile {
-        const all = try self.listScenarios(allocator, null, iso);
-        if (all.len == 0) return &.{};
-        if (query.len == 0 or top_n == 0) return all;
-
-        // Tokenize the query once.
-        var query_toks: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (query_toks.items) |t| allocator.free(t);
-            query_toks.deinit(allocator);
-        }
-        try tokenizeLower(allocator, query, &query_toks);
-
-        // Score each scenario.
-        const Scored = struct { file: types.ScenarioFile, score: f32 };
-        var scored = try allocator.alloc(Scored, all.len);
-        defer allocator.free(scored);
-        for (all, 0..) |f, i| {
-            const s = try scenarioRelevance(query_toks.items, f.path, f.content, allocator);
-            scored[i] = .{ .file = f, .score = s };
-        }
-
-        // Stable sort by score descending (zero-scorers sink to the end).
-        std.sort.block(Scored, scored, {}, struct {
-            fn lt(_: void, a: Scored, b: Scored) bool {
-                return a.score > b.score;
-            }
-        }.lt);
-
-        const keep = @min(top_n, all.len);
-        var result = try allocator.alloc(types.ScenarioFile, keep);
-        for (scored[0..keep], 0..) |s, i| {
-            result[i] = s.file;
-        }
-        // Free the dropped scenarios (the ones beyond keep).
-        for (scored[keep..]) |s| s.file.deinit(allocator);
-        return result;
-    }
-
     // ============================
     // Recall
     // ============================
@@ -844,7 +429,7 @@ pub const SqliteStore = struct {
 
     /// Recall with character budget capping. When `max_chars` > 0, the result
     /// is truncated to fit within the budget. Priority: L3 persona always included,
-    /// then L1 results (most relevant first), then L2 scenarios. Items that don't
+    /// then L1 results (most relevant first). Items that don't
     /// fit are dropped entirely (not partially truncated).
     /// Use `max_chars = 0` for unlimited (same as recall()).
     pub fn recallWithBudget(
@@ -858,9 +443,6 @@ pub const SqliteStore = struct {
         // L3 persona — always included (if exists).
         const persona = try self.readCore(allocator, iso);
 
-        // L2 scenarios ranked by relevance to the query.
-        const all_scenarios = try self.recallScenarios(allocator, query, 0, iso);
-
         // L1 hybrid search.
         const all_l1 = try self.searchL1Hybrid(allocator, query, top_k, iso, null);
 
@@ -868,17 +450,15 @@ pub const SqliteStore = struct {
         if (max_chars == 0) {
             var total_chars: usize = 0;
             if (persona) |p| total_chars += p.len;
-            for (all_scenarios) |s| total_chars += s.content.len;
             for (all_l1) |r| total_chars += r.content.len;
             return .{
                 .persona = persona,
-                .scenario_files = all_scenarios,
                 .l1_results = all_l1,
                 .total_chars = total_chars,
             };
         }
 
-        // Budget capping: persona first, then L1 (most relevant), then L2.
+        // Budget capping: persona first, then L1 (most relevant).
         var remaining = max_chars;
         var total_chars: usize = 0;
 
@@ -914,26 +494,8 @@ pub const SqliteStore = struct {
             capped_l1 = try allocator.realloc(all_l1, l1_count);
         }
 
-        // L2 scenarios.
-        var capped_scenarios: []types.ScenarioFile = all_scenarios;
-        var scenario_count: usize = 0;
-        for (all_scenarios) |s| {
-            if (s.content.len <= remaining) {
-                remaining -= s.content.len;
-                total_chars += s.content.len;
-                scenario_count += 1;
-            } else {
-                break;
-            }
-        }
-        if (scenario_count < all_scenarios.len) {
-            for (all_scenarios[scenario_count..]) |s| s.deinit(allocator);
-            capped_scenarios = try allocator.realloc(all_scenarios, scenario_count);
-        }
-
         return .{
             .persona = capped_persona,
-            .scenario_files = capped_scenarios,
             .l1_results = capped_l1,
             .total_chars = total_chars,
         };
@@ -972,25 +534,6 @@ pub const SqliteStore = struct {
     // ============================
 
     fn createSchema(db: *sqlite.Db, fts_available: bool) !void {
-        // L0 table.
-        try db.exec(
-            \\CREATE TABLE IF NOT EXISTS l0_conversations (
-            \\  record_id TEXT PRIMARY KEY,
-            \\  session_key TEXT NOT NULL,
-            \\  session_id TEXT NOT NULL,
-            \\  team_id TEXT NOT NULL DEFAULT 'default',
-            \\  user_id TEXT NOT NULL DEFAULT 'default',
-            \\  agent_id TEXT NOT NULL DEFAULT 'default',
-            \\  task_id TEXT NOT NULL DEFAULT '',
-            \\  role TEXT NOT NULL,
-            \\  message_text TEXT NOT NULL,
-            \\  recorded_at TEXT NOT NULL,
-            \\  timestamp INTEGER NOT NULL
-            \\)
-        );
-        try db.exec("CREATE INDEX IF NOT EXISTS idx_l0_session ON l0_conversations(session_id)");
-        try db.exec("CREATE INDEX IF NOT EXISTS idx_l0_timestamp ON l0_conversations(timestamp)");
-
         // L1 table.
         try db.exec(
             \\CREATE TABLE IF NOT EXISTS l1_records (
@@ -1039,13 +582,6 @@ pub const SqliteStore = struct {
         // FTS5 tables + triggers (only if FTS5 is available).
         if (fts_available) {
             try db.exec(
-                \\CREATE VIRTUAL TABLE IF NOT EXISTS l0_fts USING fts5(
-                \\  message_text,
-                \\  content='l0_conversations',
-                \\  content_rowid='rowid'
-                \\)
-            );
-            try db.exec(
                 \\CREATE VIRTUAL TABLE IF NOT EXISTS l1_fts USING fts5(
                 \\  content,
                 \\  content='l1_records',
@@ -1054,16 +590,6 @@ pub const SqliteStore = struct {
             );
 
             // Triggers to keep FTS in sync.
-            try db.exec(
-                \\CREATE TRIGGER IF NOT EXISTS l0_ai AFTER INSERT ON l0_conversations BEGIN
-                \\  INSERT INTO l0_fts(rowid, message_text) VALUES (new.rowid, new.message_text);
-                \\END
-            );
-            try db.exec(
-                \\CREATE TRIGGER IF NOT EXISTS l0_ad AFTER DELETE ON l0_conversations BEGIN
-                \\  INSERT INTO l0_fts(l0_fts, rowid, message_text) VALUES('delete', old.rowid, old.message_text);
-                \\END
-            );
             try db.exec(
                 \\CREATE TRIGGER IF NOT EXISTS l1_ai AFTER INSERT ON l1_records BEGIN
                 \\  INSERT INTO l1_fts(rowid, content) VALUES (new.rowid, new.content);

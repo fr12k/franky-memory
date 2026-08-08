@@ -79,26 +79,6 @@ pub const IsolationContext = struct {
 };
 
 // ============================
-// L0 — Raw Conversations
-// ============================
-
-/// A raw conversation message captured directly from the agent loop.
-/// No LLM processing — just a verbatim record of what was said.
-pub const L0Record = struct {
-    id: []const u8,
-    session_key: []const u8,
-    session_id: []const u8,
-    role: []const u8, // "user" | "assistant" | "tool"
-    message_text: []const u8,
-    recorded_at: []const u8, // ISO 8601
-    timestamp: i64, // epoch ms
-    team_id: []const u8 = "default",
-    user_id: []const u8 = "default",
-    agent_id: []const u8 = "default",
-    task_id: []const u8 = "",
-};
-
-// ============================
 // L1 — Structured Memories
 // ============================
 
@@ -193,8 +173,6 @@ pub const StoreCapabilities = struct {
 pub const RecallResult = struct {
     /// L3 persona content (markdown), or null if no persona file exists.
     persona: ?[]const u8 = null,
-    /// L2 scenario files relevant to the query.
-    scenario_files: []ScenarioFile = &.{},
     /// L1 hybrid search hits (vector + BM25 + RRF).
     l1_results: []SearchResult = &.{},
     /// Total character count of all content (for budget capping).
@@ -202,39 +180,14 @@ pub const RecallResult = struct {
 
     pub fn deinit(self: *RecallResult, allocator: std.mem.Allocator) void {
         if (self.persona) |p| allocator.free(p);
-        for (self.scenario_files) |f| f.deinit(allocator);
-        if (self.scenario_files.len > 0) allocator.free(self.scenario_files);
         for (self.l1_results) |r| r.deinit(allocator);
         if (self.l1_results.len > 0) allocator.free(self.l1_results);
-    }
-};
-
-/// An L2 scenario markdown file.
-pub const ScenarioFile = struct {
-    path: []const u8,
-    content: []const u8,
-    version: u32,
-
-    pub fn deinit(self: ScenarioFile, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        allocator.free(self.content);
     }
 };
 
 // ============================
 // Query Filters
 // ============================
-
-/// Filter for querying L0 conversations.
-pub const L0QueryFilter = struct {
-    session_id: ?[]const u8 = null,
-    time_start_ms: ?i64 = null,
-    time_end_ms: ?i64 = null,
-    /// Only return messages with recorded_at strictly after this ISO timestamp.
-    updated_after: ?[]const u8 = null,
-    limit: u32 = 100,
-    offset: u32 = 0,
-};
 
 /// Filter for querying L1 records.
 pub const L1QueryFilter = struct {

@@ -1,7 +1,7 @@
 //! Integration tests for the embedded SQLite memory store.
 //!
 //! These tests create a real temporary SQLite database and exercise
-//! the L0/L1/L2/L3 CRUD + search operations end-to-end.
+//! the L1/L2/L3 CRUD + search operations end-to-end.
 
 const std = @import("std");
 const agent_memory = @import("agent_memory");
@@ -73,20 +73,6 @@ const TestCtx = struct {
     }
 };
 
-/// Free all owned strings in an L0Record.
-fn freeL0Record(allocator: std.mem.Allocator, r: types.L0Record) void {
-    allocator.free(r.id);
-    allocator.free(r.session_key);
-    allocator.free(r.session_id);
-    allocator.free(r.team_id);
-    allocator.free(r.user_id);
-    allocator.free(r.agent_id);
-    allocator.free(r.task_id);
-    allocator.free(r.role);
-    allocator.free(r.message_text);
-    allocator.free(r.recorded_at);
-}
-
 // ============================
 // Tests
 // ============================
@@ -98,91 +84,6 @@ test "SqliteStore init creates schema" {
     // The store should report FTS5 capability.
     const caps = ctx.store.capabilities;
     try std.testing.expect(caps.fts_search);
-}
-
-test "L0 add + query round-trip" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{ .session_id = "s1" };
-    const records = [_]types.L0Record{
-        .{
-            .id = "msg-001",
-            .session_key = "sk1",
-            .session_id = "s1",
-            .role = "user",
-            .message_text = "hello world",
-            .recorded_at = "2025-01-15T10:00:00Z",
-            .timestamp = 1736932800000,
-        },
-        .{
-            .id = "msg-002",
-            .session_key = "sk1",
-            .session_id = "s1",
-            .role = "assistant",
-            .message_text = "hi there! how can I help?",
-            .recorded_at = "2025-01-15T10:00:01Z",
-            .timestamp = 1736932801000,
-        },
-    };
-
-    try ctx.store.addConversation(&records, iso);
-
-    // Query them back.
-    const result = try ctx.store.queryConversation(ctx.allocator, .{ .limit = 10 }, iso);
-    defer {
-        for (result) |r| freeL0Record(ctx.allocator, r);
-        ctx.allocator.free(result);
-    }
-
-    try std.testing.expectEqual(@as(usize, 2), result.len);
-    try std.testing.expectEqualStrings("msg-001", result[0].id);
-    try std.testing.expectEqualStrings("hello world", result[0].message_text);
-    try std.testing.expectEqualStrings("msg-002", result[1].id);
-    try std.testing.expectEqualStrings("hi there! how can I help?", result[1].message_text);
-}
-
-test "L0 query with updated_after filter" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{ .session_id = "s1" };
-    const records = [_]types.L0Record{
-        .{
-            .id = "msg-001",
-            .session_key = "sk1",
-            .session_id = "s1",
-            .role = "user",
-            .message_text = "first message",
-            .recorded_at = "2025-01-15T10:00:00Z",
-            .timestamp = 1736932800000,
-        },
-        .{
-            .id = "msg-002",
-            .session_key = "sk1",
-            .session_id = "s1",
-            .role = "assistant",
-            .message_text = "second message",
-            .recorded_at = "2025-01-15T11:00:00Z",
-            .timestamp = 1736936400000,
-        },
-    };
-
-    try ctx.store.addConversation(&records, iso);
-
-    // Query only messages after 10:30.
-    const result = try ctx.store.queryConversation(
-        ctx.allocator,
-        .{ .updated_after = "2025-01-15T10:30:00Z", .limit = 10 },
-        iso,
-    );
-    defer {
-        for (result) |r| freeL0Record(ctx.allocator, r);
-        ctx.allocator.free(result);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expectEqualStrings("msg-002", result[0].id);
 }
 
 test "L1 upsert + FTS search" {
@@ -359,41 +260,6 @@ test "L3 persona read when missing returns null" {
     try std.testing.expectEqual(@as(?[]u8, null), read);
 }
 
-test "L2 scenario write + read" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{};
-    const scenario_content = "# Debugging Auth Module\n\nFound nil pointer in middleware.\nAdded tests.";
-
-    try ctx.store.writeScenario("debugging-auth.md", scenario_content, iso);
-
-    const read = try ctx.store.readScenario(ctx.allocator, "debugging-auth.md", iso);
-    defer if (read) |r| r.deinit(ctx.allocator);
-
-    try std.testing.expect(read != null);
-    try std.testing.expectEqualStrings("debugging-auth.md", read.?.path);
-    try std.testing.expectEqualStrings(scenario_content, read.?.content);
-}
-
-test "L2 scenario list" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{};
-
-    try ctx.store.writeScenario("scenario-a.md", "content a", iso);
-    try ctx.store.writeScenario("scenario-b.md", "content b", iso);
-
-    const list = try ctx.store.listScenarios(ctx.allocator, null, iso);
-    defer {
-        for (list) |f| f.deinit(ctx.allocator);
-        ctx.allocator.free(list);
-    }
-
-    try std.testing.expectEqual(@as(usize, 2), list.len);
-}
-
 test "checkpoint set + get round-trip" {
     var ctx = try TestCtx.init();
     defer ctx.deinit();
@@ -431,9 +297,6 @@ test "recall returns L3 + L2 + L1" {
     // Write L3.
     try ctx.store.writeCore("User prefers dark mode.", iso);
 
-    // Write L2.
-    try ctx.store.writeScenario("setup.md", "Setting up the project.", iso);
-
     // Write L1.
     const l1 = types.L1Record{
         .record_id = "mem-001",
@@ -464,9 +327,6 @@ test "recall returns L3 + L2 + L1" {
     // L3 should be present.
     try std.testing.expect(result.persona != null);
     try std.testing.expectEqualStrings("User prefers dark mode.", result.persona.?);
-
-    // L2 should have at least 1 file.
-    try std.testing.expect(result.scenario_files.len >= 1);
 
     // L1 should have 1 hit.
     try std.testing.expectEqual(@as(usize, 1), result.l1_results.len);
@@ -671,37 +531,6 @@ test "L1 hybrid search without embedding returns FTS only" {
     try std.testing.expectEqualStrings("hybrid-003", results[0].record_id);
 }
 
-test "listScenarios with prefix filter" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{};
-
-    try ctx.store.writeScenario("alpha-setup.md", "Alpha setup content", iso);
-    try ctx.store.writeScenario("alpha-config.md", "Alpha config content", iso);
-    try ctx.store.writeScenario("beta-deploy.md", "Beta deploy content", iso);
-
-    // List with prefix "alpha" — should return 2 files.
-    const results = try ctx.store.listScenarios(ctx.allocator, "alpha", iso);
-    defer {
-        for (results) |f| f.deinit(ctx.allocator);
-        ctx.allocator.free(results);
-    }
-
-    try std.testing.expectEqual(@as(usize, 2), results.len);
-    for (results) |f| {
-        try std.testing.expect(std.mem.startsWith(u8, f.path, "alpha"));
-    }
-
-    // List with no prefix — should return all 3.
-    const all = try ctx.store.listScenarios(ctx.allocator, null, iso);
-    defer {
-        for (all) |f| f.deinit(ctx.allocator);
-        ctx.allocator.free(all);
-    }
-    try std.testing.expectEqual(@as(usize, 3), all.len);
-}
-
 test "recallWithBudget caps total content" {
     var ctx = try TestCtx.init();
     defer ctx.deinit();
@@ -710,9 +539,6 @@ test "recallWithBudget caps total content" {
 
     // Write L3 persona (10 chars).
     try ctx.store.writeCore("User likes dark mode.", iso); // 20 chars
-
-    // Write L2 scenario (10 chars).
-    try ctx.store.writeScenario("setup.md", "Setup instructions here.", iso); // 25 chars
 
     // Write L1 records.
     const rec1 = types.L1Record{
@@ -763,7 +589,6 @@ test "recallWithBudget with zero budget returns everything" {
     const iso = types.IsolationContext{};
 
     try ctx.store.writeCore("Persona text", iso);
-    try ctx.store.writeScenario("s.md", "Scenario content", iso);
 
     const rec = types.L1Record{
         .record_id = "budget-003",
@@ -790,65 +615,5 @@ test "recallWithBudget with zero budget returns everything" {
     var result = try ctx.store.recallWithBudget(ctx.allocator, "memory", 5, iso, 0);
     defer result.deinit(ctx.allocator);
     try std.testing.expect(result.persona != null);
-    try std.testing.expectEqual(@as(usize, 1), result.scenario_files.len);
     try std.testing.expectEqual(@as(usize, 1), result.l1_results.len);
-}
-
-test "recallScenarios ranks by query relevance" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{};
-
-    try ctx.store.writeScenario("podman-setup.md", "How to migrate podman containers", iso);
-    try ctx.store.writeScenario("database.md", "PostgreSQL configuration for storage", iso);
-    try ctx.store.writeScenario("frontend.md", "React component styling", iso);
-
-    // Query about podman — the podman scenario should rank first.
-    const results = try ctx.store.recallScenarios(ctx.allocator, "podman migration", 3, iso);
-    defer {
-        for (results) |f| f.deinit(ctx.allocator);
-        ctx.allocator.free(results);
-    }
-
-    try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expect(std.mem.startsWith(u8, results[0].path, "podman"));
-}
-
-test "recallScenarios top_n limits results" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{};
-
-    try ctx.store.writeScenario("podman-setup.md", "How to migrate podman containers", iso);
-    try ctx.store.writeScenario("database.md", "PostgreSQL configuration", iso);
-    try ctx.store.writeScenario("frontend.md", "React component styling", iso);
-
-    // Query about podman, top_n=1 — only the podman scenario returned.
-    const results = try ctx.store.recallScenarios(ctx.allocator, "podman migration", 1, iso);
-    defer {
-        for (results) |f| f.deinit(ctx.allocator);
-        ctx.allocator.free(results);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expect(std.mem.startsWith(u8, results[0].path, "podman"));
-}
-
-test "recallWithBudget uses ranked scenarios" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const iso = types.IsolationContext{};
-
-    try ctx.store.writeScenario("podman-setup.md", "How to migrate podman containers", iso);
-    try ctx.store.writeScenario("frontend.md", "React component styling unrelated content here", iso);
-
-    var result = try ctx.store.recallWithBudget(ctx.allocator, "podman migration", 5, iso, 0);
-    defer result.deinit(ctx.allocator);
-
-    // The podman scenario should be ranked before the frontend one.
-    try std.testing.expectEqual(@as(usize, 2), result.scenario_files.len);
-    try std.testing.expect(std.mem.startsWith(u8, result.scenario_files[0].path, "podman"));
 }

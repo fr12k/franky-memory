@@ -114,16 +114,10 @@ pub const MemoryContext = struct {
 pub const SqliteStoreVTable = store_mod.MemoryStore.VTable{
     .deinit = vtableDeinit,
     .capabilities = vtableCapabilities,
-    .add_conversation = vtableAddConversation,
-    .query_conversation = vtableQueryConversation,
-    .search_conversation = vtableSearchConversation,
     .upsert_l1 = vtableUpsertL1,
     .search_l1 = vtableSearchL1,
     .read_core = vtableReadCore,
     .write_core = vtableWriteCore,
-    .read_scenario = vtableReadScenario,
-    .write_scenario = vtableWriteScenario,
-    .list_scenarios = vtableListScenarios,
     .recall = vtableRecall,
     .recall_with_budget = vtableRecallWithBudget,
     .get_checkpoint = vtableGetCheckpoint,
@@ -138,21 +132,6 @@ fn vtableDeinit(ctx: *anyopaque) void {
 fn vtableCapabilities(ctx: *anyopaque) types.StoreCapabilities {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
     return self.capabilities;
-}
-
-fn vtableAddConversation(ctx: *anyopaque, records: []const types.L0Record, iso: types.IsolationContext) !void {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.addConversation(records, iso);
-}
-
-fn vtableQueryConversation(ctx: *anyopaque, allocator: std.mem.Allocator, filter: types.L0QueryFilter, iso: types.IsolationContext) ![]types.L0Record {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.queryConversation(allocator, filter, iso);
-}
-
-fn vtableSearchConversation(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.searchConversationFts(allocator, query, top_k, iso);
 }
 
 fn vtableUpsertL1(ctx: *anyopaque, record: types.L1Record, embedding: ?[]const f32, iso: types.IsolationContext) !bool {
@@ -173,21 +152,6 @@ fn vtableReadCore(ctx: *anyopaque, allocator: std.mem.Allocator, iso: types.Isol
 fn vtableWriteCore(ctx: *anyopaque, content: []const u8, iso: types.IsolationContext) !void {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
     return self.writeCore(content, iso);
-}
-
-fn vtableReadScenario(ctx: *anyopaque, allocator: std.mem.Allocator, path: []const u8, iso: types.IsolationContext) !?types.ScenarioFile {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.readScenario(allocator, path, iso);
-}
-
-fn vtableWriteScenario(ctx: *anyopaque, path: []const u8, content: []const u8, iso: types.IsolationContext) !void {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.writeScenario(path, content, iso);
-}
-
-fn vtableListScenarios(ctx: *anyopaque, allocator: std.mem.Allocator, path_prefix: ?[]const u8, iso: types.IsolationContext) ![]types.ScenarioFile {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.listScenarios(allocator, path_prefix, iso);
 }
 
 fn vtableRecall(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
@@ -380,9 +344,8 @@ test "MemoryContext recall returns empty on fresh store" {
     var result = try mem_ctx.recall(allocator, "test query", 5);
     defer result.deinit(allocator);
 
-    // Fresh store → no persona, no scenarios, no L1 hits.
+    // Fresh store → no persona, no L1 hits.
     try std.testing.expectEqual(@as(?[]const u8, null), result.persona);
-    try std.testing.expectEqual(@as(usize, 0), result.scenario_files.len);
     try std.testing.expectEqual(@as(usize, 0), result.l1_results.len);
     try std.testing.expectEqual(@as(usize, 0), result.total_chars);
 }
