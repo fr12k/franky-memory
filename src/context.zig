@@ -89,7 +89,7 @@ pub const MemoryContext = struct {
             .metadata_json = "{}",
         };
 
-        return self.store.upsertL1(record, null, self.iso);
+        return self.store.upsertL1(record, self.iso);
     }
 
     /// Recall — the main entry point for system prompt injection.
@@ -118,8 +118,6 @@ pub const SqliteStoreVTable = store_mod.MemoryStore.VTable{
     .search_l1 = vtableSearchL1,
     .recall = vtableRecall,
     .recall_with_budget = vtableRecallWithBudget,
-    .get_checkpoint = vtableGetCheckpoint,
-    .set_checkpoint = vtableSetCheckpoint,
 };
 
 fn vtableDeinit(ctx: *anyopaque) void {
@@ -132,14 +130,14 @@ fn vtableCapabilities(ctx: *anyopaque) types.StoreCapabilities {
     return self.capabilities;
 }
 
-fn vtableUpsertL1(ctx: *anyopaque, record: types.L1Record, embedding: ?[]const f32, iso: types.IsolationContext) !bool {
+fn vtableUpsertL1(ctx: *anyopaque, record: types.L1Record, iso: types.IsolationContext) !bool {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.upsertL1(record, embedding, iso);
+    return self.upsertL1(record, iso);
 }
 
 fn vtableSearchL1(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.searchL1Hybrid(allocator, query, top_k, iso, null);
+    return self.searchL1Hybrid(allocator, query, top_k, iso);
 }
 
 fn vtableRecall(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
@@ -150,16 +148,6 @@ fn vtableRecall(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8
 fn vtableRecallWithBudget(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext, max_chars: usize) !types.RecallResult {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
     return self.recallWithBudget(allocator, query, top_k, iso, max_chars);
-}
-
-fn vtableGetCheckpoint(ctx: *anyopaque, allocator: std.mem.Allocator) !types.Checkpoint {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.getCheckpoint(allocator);
-}
-
-fn vtableSetCheckpoint(ctx: *anyopaque, checkpoint: types.Checkpoint) !void {
-    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
-    return self.setCheckpoint(checkpoint);
 }
 
 // ============================
