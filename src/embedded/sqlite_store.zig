@@ -14,7 +14,6 @@ const std = @import("std");
 const sqlite = @import("sqlite.zig");
 const types = @import("../types.zig");
 const rrf = @import("rrf.zig");
-const vector = @import("vector.zig");
 const store = @import("../store.zig");
 const context = @import("../context.zig");
 
@@ -80,7 +79,6 @@ pub const SqliteStore = struct {
     pub fn upsertL1(
         self: *SqliteStore,
         record: types.L1Record,
-        embedding: ?[]const f32,
         iso: types.IsolationContext,
     ) !bool {
         _ = iso; // isolation fields are already in the record
@@ -125,33 +123,6 @@ pub const SqliteStore = struct {
         try stmt.bindText(18, record.metadata_json);
 
         _ = try stmt.step();
-
-        // Store embedding if provided.
-        if (embedding) |emb| {
-            // Pack f32[] as little-endian bytes.
-            const blob_len = emb.len * @sizeOf(f32);
-            const blob = try self.allocator.alloc(u8, blob_len);
-            defer self.allocator.free(blob);
-            for (emb, 0..) |v, i| {
-                const bytes = std.mem.toBytes(v);
-                @memcpy(blob[i * 4 ..][0..4], &bytes);
-            }
-
-            // Delete + insert for embedding.
-            const del_emb = "DELETE FROM l1_embeddings WHERE record_id = ?";
-            var del_emb_stmt = try self.db.prepare(del_emb);
-            defer del_emb_stmt.finalize();
-            try del_emb_stmt.bindText(1, record.record_id);
-            _ = try del_emb_stmt.step();
-
-            const emb_sql = "INSERT INTO l1_embeddings (record_id, embedding, dimensions, provider, model) VALUES (?, ?, ?, '', '')";
-            var emb_stmt = try self.db.prepare(emb_sql);
-            defer emb_stmt.finalize();
-            try emb_stmt.bindText(1, record.record_id);
-            try emb_stmt.bindBlob(2, blob);
-            try emb_stmt.bindInt(3, @intCast(emb.len));
-            _ = try emb_stmt.step();
-        }
 
         try self.db.exec("COMMIT");
         return true;
@@ -212,115 +183,6 @@ pub const SqliteStore = struct {
         return try results.toOwnedSlice(allocator);
     }
 
-    /// Vector similarity search on L1 records using cosine similarity.
-    /// `query_embedding` is the f32 embedding vector for the query.
-    /// Returns SearchResult slice sorted by similarity descending.
-    pub fn searchL1Vector(
-        self: *SqliteStore,
-        allocator: std.mem.Allocator,
-        query_embedding: []const f32,
-        top_k: u32,
-        iso: types.IsolationContext,
-    ) ![]types.SearchResult {
-        if (query_embedding.len == 0) return &.{};
-
-        // Fetch all L1 records that have embeddings, scoped by isolation.
-        const sql =
-            "SELECT e.record_id, e.embedding, e.dimensions, " ++
-            "l.content, l.type, l.priority, l.scene_name, " ++
-            "l.session_id, l.team_id, l.user_id, l.agent_id " ++
-            "FROM l1_embeddings e JOIN l1_records l ON e.record_id = l.record_id " ++
-            "WHERE l.team_id = ? AND l.agent_id = ? AND l.user_id = ?";
-
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-
-        try stmt.bindText(1, iso.team_id);
-        try stmt.bindText(2, iso.agent_id);
-        try stmt.bindText(3, iso.user_id);
-
-        // Collect candidate embeddings + metadata.
-        const Candidate = struct {
-            record_id: []u8,
-            content: []u8,
-            mem_type: types.MemoryType,
-            priority: f32,
-            scene_name: []u8,
-            session_id: []u8,
-            team_id: []u8,
-            user_id: []u8,
-            agent_id: []u8,
-            embedding: []f32,
-        };
-
-        var candidates: std.ArrayList(Candidate) = .empty;
-        defer {
-            for (candidates.items) |c| {
-                allocator.free(c.record_id);
-                allocator.free(c.content);
-                allocator.free(c.scene_name);
-                allocator.free(c.session_id);
-                allocator.free(c.team_id);
-                allocator.free(c.user_id);
-                allocator.free(c.agent_id);
-                allocator.free(c.embedding);
-            }
-            candidates.deinit(allocator);
-        }
-
-        while (try stmt.step()) {
-            const blob = stmt.columnBlob(1);
-            const emb = vector.decodeBlob(allocator, blob) catch continue;
-            const mem_type = types.MemoryType.fromString(stmt.columnText(4)) orelse .episodic;
-            try candidates.append(allocator, .{
-                .record_id = try allocator.dupe(u8, stmt.columnText(0)),
-                .content = try allocator.dupe(u8, stmt.columnText(3)),
-                .mem_type = mem_type,
-                .priority = @floatCast(stmt.columnFloat(5)),
-                .scene_name = try allocator.dupe(u8, stmt.columnText(6)),
-                .session_id = try allocator.dupe(u8, stmt.columnText(7)),
-                .team_id = try allocator.dupe(u8, stmt.columnText(8)),
-                .user_id = try allocator.dupe(u8, stmt.columnText(9)),
-                .agent_id = try allocator.dupe(u8, stmt.columnText(10)),
-                .embedding = emb,
-            });
-        }
-
-        if (candidates.items.len == 0) return &.{};
-
-        // Compute top-k by cosine similarity.
-        var embeddings = try allocator.alloc([]const f32, candidates.items.len);
-        defer allocator.free(embeddings);
-        for (candidates.items, 0..) |c, i| embeddings[i] = c.embedding;
-
-        const scored = try vector.topK(allocator, query_embedding, embeddings, top_k);
-        defer allocator.free(scored);
-
-        var results: std.ArrayList(types.SearchResult) = .empty;
-        defer results.deinit(allocator);
-        errdefer {
-            for (results.items) |r| r.deinit(allocator);
-        }
-
-        for (scored) |s| {
-            const c = candidates.items[s.index];
-            try results.append(allocator, .{
-                .record_id = try allocator.dupe(u8, c.record_id),
-                .content = try allocator.dupe(u8, c.content),
-                .type = c.mem_type,
-                .priority = c.priority,
-                .scene_name = try allocator.dupe(u8, c.scene_name),
-                .score = s.score,
-                .session_id = try allocator.dupe(u8, c.session_id),
-                .team_id = try allocator.dupe(u8, c.team_id),
-                .user_id = try allocator.dupe(u8, c.user_id),
-                .agent_id = try allocator.dupe(u8, c.agent_id),
-            });
-        }
-
-        return try results.toOwnedSlice(allocator);
-    }
-
     /// Hybrid search: FTS + optional vector, merged with RRF.
     /// When `query_embedding` is provided, FTS and vector results are
     /// fused via Reciprocal Rank Fusion. Otherwise, FTS-only.
@@ -330,36 +192,13 @@ pub const SqliteStore = struct {
         query: []const u8,
         top_k: u32,
         iso: types.IsolationContext,
-        query_embedding: ?[]const f32,
     ) ![]types.SearchResult {
         if (!self.capabilities.fts_search) return &.{};
 
         // Phase 1: FTS5 search.
         const fts_results = try self.searchL1Fts(allocator, query, top_k, iso);
 
-        // If no query embedding, return FTS-only.
-        if (query_embedding == null) return fts_results;
-
-        // Phase 2: Vector search.
-        const vec_results = try self.searchL1Vector(allocator, query_embedding.?, top_k, iso);
-
-        // If either result set is empty, return the non-empty one.
-        if (fts_results.len == 0) return vec_results;
-        if (vec_results.len == 0) return fts_results;
-
-        // RRF-merge FTS + vector results.
-        // Both lists need to be freed after merge, but merge deep-copies.
-        defer {
-            for (fts_results) |r| r.deinit(allocator);
-            allocator.free(fts_results);
-        }
-        defer {
-            for (vec_results) |r| r.deinit(allocator);
-            allocator.free(vec_results);
-        }
-
-        const lists = [_][]const types.SearchResult{ fts_results, vec_results };
-        return try rrf.merge(allocator, &lists, top_k);
+        return fts_results;
     }
 
     // ============================
@@ -392,7 +231,7 @@ pub const SqliteStore = struct {
         max_chars: usize,
     ) !types.RecallResult {
         // L1 hybrid search.
-        const all_l1 = try self.searchL1Hybrid(allocator, query, top_k, iso, null);
+        const all_l1 = try self.searchL1Hybrid(allocator, query, top_k, iso);
 
         // If no budget, return everything.
         if (max_chars == 0) {
@@ -433,34 +272,6 @@ pub const SqliteStore = struct {
     }
 
     // ============================
-    // Checkpoint
-    // ============================
-
-    pub fn getCheckpoint(self: *SqliteStore, allocator: std.mem.Allocator) !types.Checkpoint {
-        const sql = "SELECT value FROM pipeline_checkpoint WHERE key = 'last_processed'";
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-
-        if (try stmt.step()) {
-            const value = stmt.columnText(0);
-            // Parse JSON: {"timestamp": "...", "scene_name": "..."}
-            return parseCheckpoint(allocator, value);
-        }
-        return .{};
-    }
-
-    pub fn setCheckpoint(self: *SqliteStore, checkpoint: types.Checkpoint) !void {
-        const json = try serializeCheckpoint(self.allocator, checkpoint);
-        defer self.allocator.free(json);
-
-        const sql = "INSERT OR REPLACE INTO pipeline_checkpoint (key, value) VALUES ('last_processed', ?)";
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-        try stmt.bindText(1, json);
-        _ = try stmt.step();
-    }
-
-    // ============================
     // Schema Creation
     // ============================
 
@@ -490,25 +301,6 @@ pub const SqliteStore = struct {
         );
         try db.exec("CREATE INDEX IF NOT EXISTS idx_l1_session ON l1_records(session_id)");
         try db.exec("CREATE INDEX IF NOT EXISTS idx_l1_type ON l1_records(type)");
-
-        // L1 embeddings table (optional, for vector search).
-        try db.exec(
-            \\CREATE TABLE IF NOT EXISTS l1_embeddings (
-            \\  record_id TEXT PRIMARY KEY REFERENCES l1_records(record_id) ON DELETE CASCADE,
-            \\  embedding BLOB NOT NULL,
-            \\  dimensions INTEGER NOT NULL,
-            \\  provider TEXT NOT NULL DEFAULT '',
-            \\  model TEXT NOT NULL DEFAULT ''
-            \\)
-        );
-
-        // Pipeline checkpoint table.
-        try db.exec(
-            \\CREATE TABLE IF NOT EXISTS pipeline_checkpoint (
-            \\  key TEXT PRIMARY KEY,
-            \\  value TEXT NOT NULL
-            \\)
-        );
 
         // FTS5 tables + triggers (only if FTS5 is available).
         if (fts_available) {

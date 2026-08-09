@@ -17,7 +17,6 @@ pub const store = @import("store.zig");
 pub const context = @import("context.zig");
 pub const embedded = @import("embedded/sqlite_store.zig");
 pub const rrf = @import("embedded/rrf.zig");
-pub const vector = @import("embedded/vector.zig");
 
 // Re-export key types at the top level for convenience.
 pub const MemoryType = types.MemoryType;
@@ -39,7 +38,6 @@ test {
     // Pull in all test files when running `zig test`.
     std.testing.refAllDecls(types);
     std.testing.refAllDecls(rrf);
-    std.testing.refAllDecls(vector);
     std.testing.refAllDecls(embedded);
     std.testing.refAllDecls(context);
 }
