@@ -1410,7 +1410,7 @@ In franky's `build.zig.zon`:
     .zompress = .{ ... },
     .agent_memory = .{
         .url = "https://github.com/franky-agent/franky-memory/archive/refs/tags/v0.5.0.tar.gz",
-        .hash = "agent_memory-0.5.0-yf36fgpinQAZnwEvO_CLblpYsvJlD6cBxjTkw8T8JygT",
+        .hash = "agent_memory-0.5.0-yf36fsNlnQDwhE16OHwexQw2C4NxB7Md1jcgiXctl_kK",
     },
 },
 ```
