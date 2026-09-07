@@ -675,8 +675,37 @@ test "hard delete removes record permanently" {
     // Cannot be restored (row is gone).
     try std.testing.expect(!(try ctx.store.restoreL1("del-004", iso)));
 
-    // Hard-deleting the same id again returns false.
+    // Hard-deleting the same id again returns false (row is physically gone).
     try std.testing.expect(!(try ctx.store.deleteL1("del-004", .{ .soft = false }, iso)));
+}
+
+test "hard delete force-removes a soft-deleted record" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    _ = try ctx.store.upsertL1(makeRecord("del-005", "User uses MongoDB in staging"), iso);
+
+    // Soft delete first — the row is now deleted=1.
+    try std.testing.expect(try ctx.store.deleteL1("del-005", .{}, iso));
+
+    // A second SOFT delete is a no-op (already soft-deleted).
+    try std.testing.expect(!(try ctx.store.deleteL1("del-005", .{}, iso)));
+
+    // A HARD delete force-removes the soft-deleted row.
+    try std.testing.expect(try ctx.store.deleteL1("del-005", .{ .soft = false }, iso));
+
+    // Gone for good: not restorable, not searchable.
+    try std.testing.expect(!(try ctx.store.restoreL1("del-005", iso)));
+    const results = try ctx.store.searchL1Fts(ctx.allocator, "MongoDB", 5, iso);
+    defer {
+        for (results) |r| r.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+
+    // And it no longer counts as soft-deleted for a purge.
+    try std.testing.expectEqual(@as(u32, 0), try ctx.store.purgeDeletedL1(iso));
 }
 
 test "purge removes soft-deleted records and returns count" {

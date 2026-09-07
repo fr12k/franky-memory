@@ -137,49 +137,42 @@ pub const SqliteStore = struct {
     /// With `DeleteOptions{ .soft = true }` (the default) the row is only
     /// marked `deleted = 1`: it disappears from search/recall but stays in
     /// the table and can be recovered with `restoreL1`. The FTS5 index entry
-    /// is kept — soft-deleted rows are filtered at query time.
+    /// is kept — soft-deleted rows are filtered at query time. Only a *live*
+    /// row can be soft-deleted (deleting an already-deleted row returns false).
     ///
-    /// With `.soft = false` the row is physically removed (irreversible);
-    /// the `l1_ad` trigger evicts the FTS5 entry.
+    /// With `.soft = false` the row is physically removed (irreversible),
+    /// whether it is live or soft-deleted — a force-delete. The `l1_ad`
+    /// trigger evicts the FTS5 entry.
     ///
     /// The isolation context (team/agent/user) is enforced, so a record of
     /// another tenant can never be deleted.
     ///
-    /// Returns true when a row was affected; false when no matching live
-    /// record exists (unknown id, already deleted, or isolation mismatch).
+    /// Returns true when a row was affected; false when no matching record
+    /// exists (unknown id, or isolation mismatch — and for soft delete,
+    /// already deleted).
     pub fn deleteL1(
         self: *SqliteStore,
         record_id: []const u8,
         options: types.DeleteOptions,
         iso: types.IsolationContext,
     ) !bool {
-        if (options.soft) {
-            const sql =
-                "UPDATE l1_records SET deleted = 1 " ++
+        // The two paths differ only in the SQL statement; binds and the
+        // affected-row check are shared.
+        const sql = if (options.soft)
+            "UPDATE l1_records SET deleted = 1 " ++
                 "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ? " ++
-                "AND deleted = 0";
-            var stmt = try self.db.prepare(sql);
-            defer stmt.finalize();
-            try stmt.bindText(1, record_id);
-            try stmt.bindText(2, iso.team_id);
-            try stmt.bindText(3, iso.agent_id);
-            try stmt.bindText(4, iso.user_id);
-            _ = try stmt.step();
-            return self.db.changes() > 0;
-        } else {
-            const sql =
-                "DELETE FROM l1_records " ++
-                "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ? " ++
-                "AND deleted = 0";
-            var stmt = try self.db.prepare(sql);
-            defer stmt.finalize();
-            try stmt.bindText(1, record_id);
-            try stmt.bindText(2, iso.team_id);
-            try stmt.bindText(3, iso.agent_id);
-            try stmt.bindText(4, iso.user_id);
-            _ = try stmt.step();
-            return self.db.changes() > 0;
-        }
+                "AND deleted = 0"
+        else
+            "DELETE FROM l1_records " ++
+                "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ?";
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, record_id);
+        try stmt.bindText(2, iso.team_id);
+        try stmt.bindText(3, iso.agent_id);
+        try stmt.bindText(4, iso.user_id);
+        _ = try stmt.step();
+        return self.db.changes() > 0;
     }
 
     /// Restore a soft-deleted L1 record (sets `deleted` back to 0).
@@ -423,12 +416,10 @@ pub const SqliteStore = struct {
                 \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
                 \\END
             );
-            try db.exec(
-                \\CREATE TRIGGER IF NOT EXISTS l1_au AFTER UPDATE OF content ON l1_records BEGIN
-                \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-                \\  INSERT INTO l1_fts(rowid, content) VALUES (new.rowid, new.content);
-                \\END
-            );
+            // NOTE: `l1_au` (AFTER UPDATE OF content) is created in
+            // migrateSchema — the single creation site. Older databases
+            // may carry an unguarded variant, so it is always normalized
+            // there rather than IF NOT EXISTS'd here.
         }
     }
 
@@ -445,12 +436,12 @@ pub const SqliteStore = struct {
         try db.exec("CREATE INDEX IF NOT EXISTS idx_l1_deleted ON l1_records(deleted)");
 
         // Normalize the FTS update trigger to the content-guarded version.
-        // Databases created before the soft-delete feature carry an
-        // unguarded `l1_au` (AFTER UPDATE ON ...) trigger; CREATE TRIGGER IF
-        // NOT EXISTS would leave it in place, causing needless FTS
-        // evict/re-insert churn on every soft delete/restore. Drop and
-        // recreate it (no-op for fresh databases, whose trigger already
-        // matches — dropping and recreating an identical trigger is safe).
+        // This is the single creation site for `l1_au`. Databases created
+        // before the soft-delete feature carry an unguarded `l1_au` (AFTER
+        // UPDATE ON ...); CREATE TRIGGER IF NOT EXISTS would leave it in place,
+        // causing needless FTS evict/re-insert churn on every soft
+        // delete/restore. Drop and recreate unconditionally — idempotent for
+        // databases that already have the guarded form.
         if (fts_available) {
             try db.exec("DROP TRIGGER IF EXISTS l1_au");
             try db.exec(

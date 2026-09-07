@@ -91,7 +91,8 @@ const soft_deleted = try store.deleteL1("mem-1", .{}, iso);
 // Explicit soft delete (same as above)
 _ = try store.deleteL1("mem-1", .{ .soft = true }, iso);
 
-// Hard delete: the row and its FTS5 entry are physically removed.
+// Hard delete: the row and its FTS5 entry are physically removed —
+// a force-delete that works on live and soft-deleted rows alike.
 // This is irreversible.
 _ = try store.deleteL1("mem-1", .{ .soft = false }, iso);
 
@@ -115,6 +116,9 @@ const purged = try store.purgeDeletedL1(iso);
 
 - All delete variants **respect the isolation context** (`team_id`, `agent_id`,
   `user_id`): a record that belongs to a different tenant cannot be deleted.
+- Soft delete only affects a **live** row (deleting an already-soft-deleted
+  record returns `false`). Hard delete is a **force-delete**: it removes the
+  row whether it is live or soft-deleted.
 - All delete/restore functions return `true` when a row was affected, `false`
   when no matching record exists (id not found, already deleted/restored, or
   tenant mismatch).

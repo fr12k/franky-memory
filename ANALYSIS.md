@@ -997,13 +997,14 @@ pub fn deleteL1(
         //     AND deleted = 0
         // → sqlite3_changes() == 1 means a live row was marked.
     } else {
-        // Hard delete: physically remove (the l1_ad trigger evicts the FTS row).
+        // Hard delete: physically remove — a force-delete that works on live
+        // AND soft-deleted rows alike (no deleted guard).
         // DELETE FROM l1_records
         //   WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ?
-        //     AND deleted = 0
+        // → the l1_ad trigger evicts the FTS row.
     }
     // returns: true if a row was affected, false otherwise (id unknown,
-    // already deleted, or isolation mismatch)
+    // or isolation mismatch — and for soft delete, already soft-deleted)
 }
 ```
 
@@ -1014,8 +1015,17 @@ Design decisions:
   FTS5 index entry is *kept* for soft-deleted rows — only the query path
   filters them out (`WHERE ... AND deleted = 0`). This keeps the trigger set
   trivial and makes soft delete a single-row `UPDATE` (no index churn).
-- **Hard delete** reuses the existing `l1_ad` trigger to evict the FTS entry,
-  so the trigger pair from the insert path also covers hard deletion.
+- **Hard delete is a force-delete.** It carries no `deleted` guard, so it
+  removes the row whether it is live or soft-deleted — the natural reading
+  of "permanently remove". (Without this, an agent that soft-deletes a
+  memory and later wants it truly gone would have to restore it first —
+  surprising and easy to get wrong.) It reuses the existing `l1_ad` trigger
+  to evict the FTS entry, so the trigger pair from the insert path also
+  covers hard deletion.
+- **Soft delete only affects live rows** (`AND deleted = 0`): soft-deleting
+  an already-soft-deleted record is a no-op returning `false`. Together
+  with the force-delete above this makes the state machine total:
+  live → soft → gone (hard/purge), with restore as the only way back.
 - **`restoreL1(record_id, iso)`** flips `deleted` back to `0` for a
   soft-deleted row (returns `false` if the row is live or absent).
 - **`purgeDeletedL1(iso)`** removes all soft-deleted rows under the given
@@ -1627,12 +1637,12 @@ Phase 1 (Storage + Retrieval data plane) is **complete and tested**; the v0.4.x 
 - ✅ **L1 upsert** — delete + insert pattern (for FTS sync). Upserting a soft-deleted `record_id` revives it.
 - ✅ **L1 FTS search** — `searchL1Fts()` with BM25 scoring + isolation filtering + `deleted = 0` filtering.
 - ✅ **L1 hybrid search** — `searchL1Hybrid()` (FTS-only since embeddings were removed; the RRF fusion point is retained).
-- ✅ **L1 deletion (soft + hard)** — `deleteL1(record_id, options, iso)` with `DeleteOptions{ .soft }`. Soft delete marks `deleted = 1` (single-row `UPDATE`, recoverable); hard delete removes the row (the `l1_ad` trigger evicts the FTS entry). Companion APIs: `restoreL1` (undo soft delete), `purgeDeletedL1` (garbage-collect all soft-deleted rows in scope, returns count). All paths honor `IsolationContext` and return `bool` (false = no matching row).
+- ✅ **L1 deletion (soft + hard)** — `deleteL1(record_id, options, iso)` with `DeleteOptions{ .soft }`, collapsed to shared prepare/bind/step code (the two paths differ only in SQL). Soft delete marks a **live** row `deleted = 1` (single-row `UPDATE`, recoverable, no-op on an already-soft-deleted row); hard delete is a **force-delete** that removes the row whether live or soft-deleted (the `l1_ad` trigger evicts the FTS entry). Companion APIs: `restoreL1` (undo soft delete), `purgeDeletedL1` (garbage-collect all soft-deleted rows in scope, returns count). All paths honor `IsolationContext` and return `bool` (false = no matching row).
 - ✅ **Delete-aware search/recall** — `searchL1Fts`, `searchL1Hybrid` and `recall` filter `deleted = 0` rows, so soft-deleted memories never leak into recall.
-- ✅ **Schema migration** — `SqliteStore.init()` runs `migrateSchema()`: adds the `deleted` column (`ALTER TABLE ... ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`) to existing databases, guarded by a `PRAGMA table_info` probe so it runs at most once; builds `idx_l1_deleted` after the column is guaranteed to exist; and normalizes the legacy unguarded `l1_au` trigger to `AFTER UPDATE OF content` so soft delete/restore never churn the FTS index (fresh databases already have the guarded form).
+- ✅ **Schema migration** — `SqliteStore.init()` runs `migrateSchema()`: adds the `deleted` column (`ALTER TABLE ... ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`) to existing databases, guarded by a `PRAGMA table_info` probe so it runs at most once; builds `idx_l1_deleted` after the column is guaranteed to exist; and normalizes the legacy unguarded `l1_au` trigger to `AFTER UPDATE OF content` so soft delete/restore never churn the FTS index (migrateSchema is the single `l1_au` creation site — createSchema does not pre-create it, avoiding drop/recreate churn on fresh databases).
 - ✅ **Delete APIs through vtable + MemoryContext** — `MemoryStore.deleteL1`, `restoreL1`, `purgeDeletedL1` and `MemoryContext.delete/deleteHard/restore/purgeDeleted` delegate through the vtable.
 - ✅ **Recall** — `recall()` / `recallWithBudget()` aggregate L1 hits with `total_chars` budget tracking (L2/L3 aggregation was removed with those layers).
-- ✅ **Integration tests** (`test/sqlite_store_test.zig`) — 22 end-to-end tests: init/schema, L1 upsert+FTS, no-match, upsert-replaces, recall, vtable/MemoryContext round-trip, FTS-only hybrid, recallWithBudget capping, plus 10 delete/restore/purge/isolation tests and a legacy-DB migration test.
+- ✅ **Integration tests** (`test/sqlite_store_test.zig`) — 23 end-to-end tests: init/schema, L1 upsert+FTS, no-match, upsert-replaces, recall, vtable/MemoryContext round-trip, FTS-only hybrid, recallWithBudget capping, plus 11 delete/restore/purge/isolation tests (incl. hard-delete-force-removes-soft-deleted) and a legacy-DB migration test.
 - ✅ **Unit tests** — 16 tests in types.zig + rrf.zig + context.zig (MemoryType round-trip, IsolationContext whereClause, DeleteOptions defaults, RRF merge cases, MemoryContext delegation).
 
 **Total: 38 tests pass, 0 leaks.**
