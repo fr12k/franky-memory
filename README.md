@@ -33,8 +33,8 @@ SQLite database (~/.franky/memory.db)
 ```zig
 .dependencies = .{
     .agent_memory = .{
-        .url = "https://github.com/franky-agent/franky-memory/archive/refs/tags/v0.1.0.tar.gz",
-        .hash = "agent_memory-0.0.1-<hash>",
+        .url = "https://github.com/franky-agent/franky-memory/archive/refs/tags/v0.5.0.tar.gz",
+        .hash = "agent_memory-0.5.0-<hash>",
     },
 },
 ```
