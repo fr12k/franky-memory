@@ -60,7 +60,7 @@ _ = try store.upsertL1(.{
     .agent_id = "default", .version = 1,
     .timestamp_str = "", .timestamp_start = "", .timestamp_end = "",
     .created_time = "", .updated_time = "", .metadata_json = "{}",
-}, null, .{});
+}, .{});
 
 // L1 — hybrid search (FTS5 BM25)
 const results = try store.searchL1Fts(allocator, "PostgreSQL", 5, .{});
@@ -69,6 +69,74 @@ defer { for (results) |r| r.deinit(allocator); allocator.free(results); }
 // Recall — the main entry point for prompt injection
 var recall = try store.recall(allocator, "database setup", 10, .{});
 defer recall.deinit(allocator);
+
+// L1 — delete a memory (soft by default, see "Memory deletion" below)
+const deleted = try store.deleteL1("mem-1", .{}, .{});
+```
+
+## Memory deletion
+
+Memories can be deleted either **soft** (default) or **hard**, controlled by
+`DeleteOptions`:
+
+```zig
+const agent_memory = @import("agent_memory");
+const DeleteOptions = agent_memory.DeleteOptions;
+const iso = agent_memory.IsolationContext{};
+
+// Soft delete (default): the record is marked deleted and disappears from
+// search and recall, but the row is kept and can be recovered.
+const soft_deleted = try store.deleteL1("mem-1", .{}, iso);
+
+// Explicit soft delete (same as above)
+_ = try store.deleteL1("mem-1", .{ .soft = true }, iso);
+
+// Hard delete: the row and its FTS5 entry are physically removed.
+// This is irreversible.
+_ = try store.deleteL1("mem-1", .{ .soft = false }, iso);
+
+// Restore a soft-deleted record (undoes the soft delete).
+const restored = try store.restoreL1("mem-1", iso);
+
+// Physically remove ALL soft-deleted records under this isolation context.
+// Returns the number of purged rows. After this, restore is no longer possible.
+const purged = try store.purgeDeletedL1(iso);
+```
+
+**Semantics:**
+
+| Aspect | Soft delete (`.soft = true`) | Hard delete (`.soft = false`) |
+|--------|------------------------------|-------------------------------|
+| Row in `l1_records` | kept, `deleted = 1` | removed |
+| Visible in `searchL1Fts` / `recall` | no | no |
+| Recoverable via `restoreL1` | yes | no |
+| Removed by `purgeDeletedL1` | yes | n/a (already gone) |
+| FTS5 index entry | kept (filtered out at query time) | removed via trigger |
+
+- All delete variants **respect the isolation context** (`team_id`, `agent_id`,
+  `user_id`): a record that belongs to a different tenant cannot be deleted.
+- All delete/restore functions return `true` when a row was affected, `false`
+  when no matching record exists (id not found, already deleted/restored, or
+  tenant mismatch).
+- `upsertL1` on a soft-deleted `record_id` re-creates the row with
+  `deleted = 0` — an upsert revives a soft-deleted memory.
+
+### Through the `MemoryStore` vtable / `MemoryContext`
+
+```zig
+var mem_ctx = agent_memory.MemoryContext{ .store = store.toMemoryStore(), .iso = .{} };
+
+// Soft delete via MemoryContext (delegates through the vtable)
+_ = try mem_ctx.delete("mem-1");
+
+// Hard delete via MemoryContext
+_ = try mem_ctx.deleteHard("mem-1");
+
+// Restore
+_ = try mem_ctx.restore("mem-1");
+
+// Purge all soft-deleted records in this isolation scope
+_ = try mem_ctx.purgeDeleted();
 ```
 
 ## Build
