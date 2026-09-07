@@ -52,6 +52,10 @@ pub const SqliteStore = struct {
         // Create schema.
         try createSchema(&db, caps.fts_search);
 
+        // Migrate existing databases (adds the `deleted` column and
+        // normalizes the FTS update trigger when needed).
+        try migrateSchema(&db, caps.fts_search);
+
         return .{
             .allocator = allocator,
             .io = io,
@@ -128,6 +132,89 @@ pub const SqliteStore = struct {
         return true;
     }
 
+    /// Delete an L1 record.
+    ///
+    /// With `DeleteOptions{ .soft = true }` (the default) the row is only
+    /// marked `deleted = 1`: it disappears from search/recall but stays in
+    /// the table and can be recovered with `restoreL1`. The FTS5 index entry
+    /// is kept — soft-deleted rows are filtered at query time. Only a *live*
+    /// row can be soft-deleted (deleting an already-deleted row returns false).
+    ///
+    /// With `.soft = false` the row is physically removed (irreversible),
+    /// whether it is live or soft-deleted — a force-delete. The `l1_ad`
+    /// trigger evicts the FTS5 entry.
+    ///
+    /// The isolation context (team/agent/user) is enforced, so a record of
+    /// another tenant can never be deleted.
+    ///
+    /// Returns true when a row was affected; false when no matching record
+    /// exists (unknown id, or isolation mismatch — and for soft delete,
+    /// already deleted).
+    pub fn deleteL1(
+        self: *SqliteStore,
+        record_id: []const u8,
+        options: types.DeleteOptions,
+        iso: types.IsolationContext,
+    ) !bool {
+        // The two paths differ only in the SQL statement; binds and the
+        // affected-row check are shared.
+        const sql = if (options.soft)
+            "UPDATE l1_records SET deleted = 1 " ++
+                "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ? " ++
+                "AND deleted = 0"
+        else
+            "DELETE FROM l1_records " ++
+                "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ?";
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, record_id);
+        try stmt.bindText(2, iso.team_id);
+        try stmt.bindText(3, iso.agent_id);
+        try stmt.bindText(4, iso.user_id);
+        _ = try stmt.step();
+        return self.db.changes() > 0;
+    }
+
+    /// Restore a soft-deleted L1 record (sets `deleted` back to 0).
+    /// Returns true when a soft-deleted row was revived; false when the id
+    /// is unknown, the row is live, or the isolation context does not match.
+    pub fn restoreL1(
+        self: *SqliteStore,
+        record_id: []const u8,
+        iso: types.IsolationContext,
+    ) !bool {
+        const sql =
+            "UPDATE l1_records SET deleted = 0 " ++
+            "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ? " ++
+            "AND deleted = 1";
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, record_id);
+        try stmt.bindText(2, iso.team_id);
+        try stmt.bindText(3, iso.agent_id);
+        try stmt.bindText(4, iso.user_id);
+        _ = try stmt.step();
+        return self.db.changes() > 0;
+    }
+
+    /// Physically remove all soft-deleted records within the isolation scope
+    /// (team/agent/user). This is the garbage-collection pass — after it runs,
+    /// the purged rows can no longer be restored.
+    ///
+    /// Returns the number of purged rows.
+    pub fn purgeDeletedL1(self: *SqliteStore, iso: types.IsolationContext) !u32 {
+        const sql =
+            "DELETE FROM l1_records " ++
+            "WHERE team_id = ? AND agent_id = ? AND user_id = ? AND deleted = 1";
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, iso.team_id);
+        try stmt.bindText(2, iso.agent_id);
+        try stmt.bindText(3, iso.user_id);
+        _ = try stmt.step();
+        return @intCast(self.db.changes());
+    }
+
     /// FTS5 keyword search on L1 records.
     pub fn searchL1Fts(
         self: *SqliteStore,
@@ -146,6 +233,7 @@ pub const SqliteStore = struct {
             "bm25(l1_fts) AS score, l1.session_id, l1.team_id, l1.user_id, l1.agent_id " ++
             "FROM l1_fts JOIN l1_records l1 ON l1_fts.rowid = l1.rowid " ++
             "WHERE l1_fts MATCH ? AND l1.team_id = ? AND l1.agent_id = ? AND l1.user_id = ? " ++
+            "AND l1.deleted = 0 " ++
             "ORDER BY score LIMIT ?";
 
         var stmt = try self.db.prepare(sql);
@@ -296,11 +384,16 @@ pub const SqliteStore = struct {
             \\  timestamp_end TEXT NOT NULL DEFAULT '',
             \\  created_time TEXT NOT NULL DEFAULT '',
             \\  updated_time TEXT NOT NULL DEFAULT '',
-            \\  metadata_json TEXT NOT NULL DEFAULT '{}'
+            \\  metadata_json TEXT NOT NULL DEFAULT '{}',
+            \\  deleted INTEGER NOT NULL DEFAULT 0
             \\)
         );
         try db.exec("CREATE INDEX IF NOT EXISTS idx_l1_session ON l1_records(session_id)");
         try db.exec("CREATE INDEX IF NOT EXISTS idx_l1_type ON l1_records(type)");
+        // NOTE: idx_l1_deleted is created in migrateSchema — it can only be
+        // built once the `deleted` column is guaranteed to exist, which for
+        // databases created before this column is only after the ALTER TABLE
+        // in migrateSchema runs.
 
         // FTS5 tables + triggers (only if FTS5 is available).
         if (fts_available) {
@@ -323,13 +416,51 @@ pub const SqliteStore = struct {
                 \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
                 \\END
             );
+            // NOTE: `l1_au` (AFTER UPDATE OF content) is created in
+            // migrateSchema — the single creation site. Older databases
+            // may carry an unguarded variant, so it is always normalized
+            // there rather than IF NOT EXISTS'd here.
+        }
+    }
+
+    /// Migrate an existing database to the current schema in place.
+    /// Adds the `deleted` column to `l1_records` when missing (idempotent:
+    /// a PRAGMA table_info probe runs first, so the ALTER runs at most once).
+    /// Runs after createSchema, so the table is guaranteed to exist.
+    fn migrateSchema(db: *sqlite.Db, fts_available: bool) !void {
+        if (!try hasL1DeletedColumn(db)) {
+            try db.exec("ALTER TABLE l1_records ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0");
+        }
+        // Safe here for both fresh and old databases: the column exists in
+        // either case (CREATE TABLE for fresh, ALTER TABLE just above for old).
+        try db.exec("CREATE INDEX IF NOT EXISTS idx_l1_deleted ON l1_records(deleted)");
+
+        // Normalize the FTS update trigger to the content-guarded version.
+        // This is the single creation site for `l1_au`. Databases created
+        // before the soft-delete feature carry an unguarded `l1_au` (AFTER
+        // UPDATE ON ...); CREATE TRIGGER IF NOT EXISTS would leave it in place,
+        // causing needless FTS evict/re-insert churn on every soft
+        // delete/restore. Drop and recreate unconditionally — idempotent for
+        // databases that already have the guarded form.
+        if (fts_available) {
+            try db.exec("DROP TRIGGER IF EXISTS l1_au");
             try db.exec(
-                \\CREATE TRIGGER IF NOT EXISTS l1_au AFTER UPDATE ON l1_records BEGIN
+                \\CREATE TRIGGER l1_au AFTER UPDATE OF content ON l1_records BEGIN
                 \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
                 \\  INSERT INTO l1_fts(rowid, content) VALUES (new.rowid, new.content);
                 \\END
             );
         }
+    }
+
+    /// Returns true when `l1_records` already carries a `deleted` column.
+    fn hasL1DeletedColumn(db: *sqlite.Db) !bool {
+        var stmt = try db.prepare("PRAGMA table_info(l1_records)");
+        defer stmt.finalize();
+        while (try stmt.step()) {
+            if (std.mem.eql(u8, stmt.columnText(1), "deleted")) return true;
+        }
+        return false;
     }
 
     fn detectFts5(db: *sqlite.Db) !void {

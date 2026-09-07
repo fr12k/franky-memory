@@ -30,9 +30,13 @@ pub const Checkpoint = types.Checkpoint;
 pub const ExtractionResult = types.ExtractionResult;
 pub const DedupAction = types.DedupAction;
 pub const DedupDecision = types.DedupDecision;
+pub const DeleteOptions = types.DeleteOptions;
 pub const MemoryStore = store.MemoryStore;
 pub const SqliteStore = embedded.SqliteStore;
 pub const MemoryContext = context.MemoryContext;
+/// Low-level SQLite C bindings (Db/Stmt wrappers). Exposed for maintenance
+/// tooling and tests that need to inspect or fabricate database files.
+pub const sqlite = @import("embedded/sqlite.zig");
 
 test {
     // Pull in all test files when running `zig test`.

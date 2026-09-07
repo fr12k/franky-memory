@@ -711,6 +711,15 @@ pub const ScenarioFile = struct {
         allocator.free(self.content);
     }
 };
+
+/// Options for deleting an L1 memory record.
+pub const DeleteOptions = struct {
+    /// When true (default), the record is soft-deleted: the row is kept with
+    /// `deleted = 1` and disappears from search/recall, but can be recovered
+    /// with `restoreL1`. When false, the row is physically removed
+    /// (irreversible).
+    soft: bool = true,
+};
 ```
 
 ### 6.3 Store Interface (`store.zig`)
@@ -772,8 +781,20 @@ pub const MemoryStore = struct {
         delete_l1: *const fn (
             ctx: *anyopaque,
             record_id: []const u8,
+            options: DeleteOptions,
             iso: IsolationContext,
         ) anyerror!bool,
+
+        restore_l1: *const fn (
+            ctx: *anyopaque,
+            record_id: []const u8,
+            iso: IsolationContext,
+        ) anyerror!bool,
+
+        purge_deleted_l1: *const fn (
+            ctx: *anyopaque,
+            iso: IsolationContext,
+        ) anyerror!u32,
 
         // L2/L3 — markdown files
         read_scenario: *const fn (
@@ -907,10 +928,12 @@ CREATE TABLE IF NOT EXISTS l1_records (
   timestamp_end TEXT NOT NULL,
   created_time TEXT NOT NULL,
   updated_time TEXT NOT NULL,
-  metadata_json TEXT NOT NULL DEFAULT '{}'
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  deleted INTEGER NOT NULL DEFAULT 0      -- 1 = soft-deleted, filtered from search/recall
 );
 CREATE INDEX IF NOT EXISTS idx_l1_session ON l1_records(session_id);
 CREATE INDEX IF NOT EXISTS idx_l1_type ON l1_records(type);
+CREATE INDEX IF NOT EXISTS idx_l1_deleted ON l1_records(deleted);
 
 -- L1 full-text search
 CREATE VIRTUAL TABLE IF NOT EXISTS l1_fts USING fts5(
@@ -951,6 +974,74 @@ CREATE TRIGGER l1_au AFTER UPDATE ON l1_records BEGIN
 END;
 -- Same pattern for l0_conversations / l0_fts
 ```
+
+**L1 deletion (soft + hard)** — `deleteL1(record_id, options, iso)`:
+
+The `l1_records` table carries a `deleted INTEGER NOT NULL DEFAULT 0` column.
+`SqliteStore.init()` migrates existing databases in place: when the column
+is missing, `init()` runs `ALTER TABLE l1_records ADD COLUMN deleted
+INTEGER NOT NULL DEFAULT 0` (idempotent — `PRAGMA table_info` is probed
+first, so the migration runs at most once per database).
+
+```zig
+pub fn deleteL1(
+    self: *SqliteStore,
+    record_id: []const u8,
+    options: types.DeleteOptions,
+    iso: types.IsolationContext,
+) !bool {
+    // Soft delete: mark the row, keep it recoverable.
+    if (options.soft) {
+        // UPDATE l1_records SET deleted = 1
+        //   WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ?
+        //     AND deleted = 0
+        // → sqlite3_changes() == 1 means a live row was marked.
+    } else {
+        // Hard delete: physically remove — a force-delete that works on live
+        // AND soft-deleted rows alike (no deleted guard).
+        // DELETE FROM l1_records
+        //   WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ?
+        // → the l1_ad trigger evicts the FTS row.
+    }
+    // returns: true if a row was affected, false otherwise (id unknown,
+    // or isolation mismatch — and for soft delete, already soft-deleted)
+}
+```
+
+Design decisions:
+
+- **Soft is the default.** An agent deleting a memory is usually correcting
+  itself ("that fact is wrong / stale"); a reversible operation is safer. The
+  FTS5 index entry is *kept* for soft-deleted rows — only the query path
+  filters them out (`WHERE ... AND deleted = 0`). This keeps the trigger set
+  trivial and makes soft delete a single-row `UPDATE` (no index churn).
+- **Hard delete is a force-delete.** It carries no `deleted` guard, so it
+  removes the row whether it is live or soft-deleted — the natural reading
+  of "permanently remove". (Without this, an agent that soft-deletes a
+  memory and later wants it truly gone would have to restore it first —
+  surprising and easy to get wrong.) It reuses the existing `l1_ad` trigger
+  to evict the FTS entry, so the trigger pair from the insert path also
+  covers hard deletion.
+- **Soft delete only affects live rows** (`AND deleted = 0`): soft-deleting
+  an already-soft-deleted record is a no-op returning `false`. Together
+  with the force-delete above this makes the state machine total:
+  live → soft → gone (hard/purge), with restore as the only way back.
+- **`restoreL1(record_id, iso)`** flips `deleted` back to `0` for a
+  soft-deleted row (returns `false` if the row is live or absent).
+- **`purgeDeletedL1(iso)`** removes all soft-deleted rows under the given
+  isolation scope and returns the number of purged rows — the garbage-
+  collection pass, callable on demand (e.g. session end).
+- **`upsertL1` revives:** upserting a `record_id` that is soft-deleted
+  re-inserts it with `deleted = 0` (the delete+insert upsert pattern clears
+  the flag), so saving a memory again is equivalent to restore.
+- **Trigger guard + migration normalization.** The `l1_au` trigger is declared
+  as `AFTER UPDATE OF content`, so flag-only `UPDATE`s (soft delete/restore)
+  never touch the FTS index. Databases created before this change carry an
+  unguarded `l1_au`; `init()`'s migration drops and recreates it with the
+  guard, so fresh and migrated databases behave identically.
+- **Isolation always applies.** Every statement carries the `team_id /
+  agent_id / user_id` predicates from `IsolationContext`, so a tenant can
+  never delete or purge another tenant's memories.
 
 **Hybrid search** (vector + FTS + RRF):
 
@@ -1318,8 +1409,8 @@ In franky's `build.zig.zon`:
 .dependencies = .{
     .zompress = .{ ... },
     .agent_memory = .{
-        .url = "https://github.com/fr12k/agent-memory-zig/archive/refs/tags/v0.1.0.tar.gz",
-        .hash = "agent_memory-0.0.1-<hash>",
+        .url = "https://github.com/franky-agent/franky-memory/archive/refs/tags/v0.5.0.tar.gz",
+        .hash = "agent_memory-0.5.0-yf36fsNlnQDwhE16OHwexQw2C4NxB7Md1jcgiXctl_kK",
     },
 },
 ```
@@ -1462,51 +1553,38 @@ pub const MemoryIntegration = struct {
 
 ### SQLite Schema (Summary)
 
-```sql
--- L0: raw conversations
-CREATE TABLE l0_conversations (
-  record_id TEXT PRIMARY KEY,
-  session_key TEXT, session_id TEXT,
-  team_id TEXT, user_id TEXT, agent_id TEXT, task_id TEXT,
-  role TEXT, message_text TEXT,
-  recorded_at TEXT, timestamp INTEGER
-);
-CREATE VIRTUAL TABLE l0_fts USING fts5(message_text, content='l0_conversations');
+_(Re-baselined to the v0.4.2 single-L1 design: the L0 conversation layer, L2 scenario files, L3 persona file, embeddings table, and pipeline checkpoint were removed in the v0.4.x simplification. The `deleted` column is the v0.5 soft-delete addition.)_
 
--- L1: structured memories
+```sql
+-- L1: structured memories — the only table
 CREATE TABLE l1_records (
   record_id TEXT PRIMARY KEY,
   content TEXT, type TEXT, priority REAL, scene_name TEXT,
   session_key TEXT, session_id TEXT,
   team_id TEXT, task_id TEXT, user_id TEXT, agent_id TEXT,
   version INTEGER, timestamp_str TEXT, timestamp_start TEXT, timestamp_end TEXT,
-  created_time TEXT, updated_time TEXT, metadata_json TEXT
+  created_time TEXT, updated_time TEXT, metadata_json TEXT,
+  deleted INTEGER NOT NULL DEFAULT 0      -- 1 = soft-deleted (hidden, restorable)
 );
-CREATE VIRTUAL TABLE l1_fts USING fts5(content, content='l1_records');
+CREATE INDEX idx_l1_session ON l1_records(session_id);
+CREATE INDEX idx_l1_type    ON l1_records(type);
+CREATE INDEX idx_l1_deleted  ON l1_records(deleted);
 
--- L1 embeddings (optional)
-CREATE TABLE l1_embeddings (
-  record_id TEXT PRIMARY KEY,
-  embedding BLOB, dimensions INTEGER, provider TEXT, model TEXT
-);
+-- L1 full-text search (contentless external-content FTS5)
+CREATE VIRTUAL TABLE l1_fts USING fts5(content, content='l1_records', content_rowid='rowid');
 
--- Pipeline checkpoint
-CREATE TABLE pipeline_checkpoint (key TEXT PRIMARY KEY, value TEXT);
+-- FTS sync triggers (created when FTS5 is available):
+--   l1_ai  AFTER INSERT ON l1_records            → add FTS row
+--   l1_ad  AFTER DELETE ON l1_records             → evict FTS row (hard delete path)
+--   l1_au  AFTER UPDATE OF content ON l1_records  → evict+re-add on content change only;
+--        soft delete/restore (deleted-flag UPDATEs) intentionally do NOT fire it
 ```
 
 ### File Layout
 
 ```
 ~/.franky/memory/
-├── memory.db                    ← SQLite (L0 + L1 tables)
-├── scene_blocks/                ← L2 markdown files
-│   ├── debugging-auth-module.md
-│   ├── setting-up-postgres.md
-│   └── ...
-├── persona.md                   ← L3 persona
-└── .metadata/
-    ├── checkpoint.json           ← pipeline cursor
-    └── scene_index.json          ← scene name → file mapping
+└── memory.db                    ← SQLite (l1_records + l1_fts)
 ```
 
 ### Memory Types
@@ -1519,14 +1597,10 @@ CREATE TABLE pipeline_checkpoint (key TEXT PRIMARY KEY, value TEXT);
 
 ### Recall Result Format (injected into system prompt)
 
+_(Re-baselined to the single-L1 layer: the L3 persona and L2 scenario blocks were removed in the v0.4.x simplification; only the relevant-facts list remains, capped by `recallWithBudget`.)_
+
 ```
 <memory_context>
-## Persona
-User's name is Alice. Prefers concise answers. Uses PostgreSQL.
-
-## Current Scenario
-debugging auth module — found nil pointer in middleware, adding tests.
-
 ## Relevant Facts
 - [episodic, p=75] User decided to use PostgreSQL for their database
 - [instruction, p=80] User wants tests added when fixing bugs
@@ -1549,29 +1623,31 @@ _Updated during Phase 1 implementation._
 
 ### What's Done
 
-Phase 1 (Storage + Retrieval data plane) is **complete and tested**:
+Phase 1 (Storage + Retrieval data plane) is **complete and tested**; the v0.4.x simplification reduced the store to a single L1 layer, and v0.5 adds deletion:
 
-- ✅ **Core types** (`src/types.zig`) — `MemoryType`, `IsolationContext`, `L0Record`, `L1Record`, `SearchResult`, `StoreCapabilities`, `RecallResult`, `ScenarioFile`, `Checkpoint`, `DedupDecision`, query filters. All with `deinit()` and round-trip tests.
+- ✅ **Core types** (`src/types.zig`) — `MemoryType`, `IsolationContext`, `L1Record`, `SearchResult`, `StoreCapabilities`, `RecallResult`, `Checkpoint`, `DedupDecision`, `L1QueryFilter`, `DeleteOptions`. With `deinit()` and round-trip tests. (`L0Record`/`ScenarioFile` were removed with their layers.)
 - ✅ **Isolation** — five-dimensional tenancy (team/user/agent/session/task) with `whereClause()` SQL builder. Defaults to `"default"` for single-user mode.
-- ✅ **SQLite C bindings** (`src/embedded/sqlite.zig`) — manual extern declarations (no `@cImport` in Zig 0.17-dev). Wraps `sqlite3_open_v2`, `exec`, `prepare_v2`, `step`, `bind_*`, `column_*`, `close`, `busy_timeout`, `errmsg`. ~280 lines.
-- ✅ **SQLite store** (`src/embedded/sqlite_store.zig`) — full L0/L1 CRUD + FTS5 search + L2/L3 markdown files + checkpoint + recall. ~820 lines.
-- ✅ **RRF** (`src/embedded/rrf.zig`) — Reciprocal Rank Fusion with deep-copy + sort. 5 unit tests covering empty/single/overlapping/disjoint/capped cases.
+- ✅ **SQLite C bindings** (`src/embedded/sqlite.zig`) — manual extern declarations (no `@cImport` in Zig 0.17-dev). Wraps `sqlite3_open_v2`, `exec`, `prepare_v2`, `step`, `bind_*`, `column_*`, `close`, `busy_timeout`, `errmsg`, `changes`, `last_insert_rowid`. ~280 lines. Also re-exported from the package root for maintenance tooling/tests.
+- ✅ **SQLite store** (`src/embedded/sqlite_store.zig`) — L1 CRUD + FTS5 search + recall + delete/restore/purge + in-place schema migration. ~565 lines.
+- ✅ **RRF** (`src/embedded/rrf.zig`) — Reciprocal Rank Fusion with deep-copy + sort. 5 unit tests covering empty/single/overlapping/disjoint/capped cases. (Currently exercised by the hybrid search path only when both FTS and vector legs exist; with embeddings removed it is dormant but tested.)
 - ✅ **Store vtable** (`src/store.zig`) — `MemoryStore` interface with full vtable for future backend swap.
-- ✅ **FTS5 schema** — `l0_fts` + `l1_fts` virtual tables with sync triggers (insert/delete/update).
-- ✅ **Schema auto-creation** — `SqliteStore.init()` creates all tables, indexes, triggers, and detects FTS5 support at runtime.
+- ✅ **FTS5 schema** — `l1_fts` virtual table with sync triggers (insert/delete/content-update).
+- ✅ **Schema auto-creation** — `SqliteStore.init()` creates tables, indexes, triggers, and detects FTS5 support at runtime.
 - ✅ **WAL mode** + busy_timeout + 64MB cache + foreign keys — same PRAGMAs as the TS implementation.
-- ✅ **L0 capture** — `addConversation()` with transaction-wrapped batch inserts.
-- ✅ **L0 query** — `queryConversation()` with isolation filtering + `updated_after` cursor + limit/offset.
-- ✅ **L1 upsert** — delete + insert pattern (for FTS sync), optional embedding blob storage.
-- ✅ **L1 FTS search** — `searchL1Fts()` with BM25 scoring + isolation filtering.
-- ✅ **L1 hybrid search** — `searchL1Hybrid()` (currently FTS-only; vector search deferred to Phase 2).
-- ✅ **L2/L3 files** — `readCore/writeCore` for persona.md, `readScenario/writeScenario/listScenarios` for scene_blocks/*.md.
-- ✅ **Recall** — `recall()` aggregates L3 + L2 + L1 with `total_chars` budget tracking.
-- ✅ **Checkpoint** — `getCheckpoint/setCheckpoint` in SQLite table (serialize is implemented; parse is a stub for Phase 2).
-- ✅ **Integration tests** (`test/sqlite_store_test.zig`) — 12 end-to-end tests: init/schema, L0 add+query, L0 updated_after filter, L1 upsert+FTS, L1 no-match, L1 upsert replaces, L3 write+read, L3 missing returns null, L2 write+read, L2 list, checkpoint, recall.
-- ✅ **Unit tests** — 12 tests in types.zig + rrf.zig (MemoryType round-trip, IsolationContext whereClause, RRF merge cases).
+- ✅ **L1 upsert** — delete + insert pattern (for FTS sync). Upserting a soft-deleted `record_id` revives it.
+- ✅ **L1 FTS search** — `searchL1Fts()` with BM25 scoring + isolation filtering + `deleted = 0` filtering.
+- ✅ **L1 hybrid search** — `searchL1Hybrid()` (FTS-only since embeddings were removed; the RRF fusion point is retained).
+- ✅ **L1 deletion (soft + hard)** — `deleteL1(record_id, options, iso)` with `DeleteOptions{ .soft }`, collapsed to shared prepare/bind/step code (the two paths differ only in SQL). Soft delete marks a **live** row `deleted = 1` (single-row `UPDATE`, recoverable, no-op on an already-soft-deleted row); hard delete is a **force-delete** that removes the row whether live or soft-deleted (the `l1_ad` trigger evicts the FTS entry). Companion APIs: `restoreL1` (undo soft delete), `purgeDeletedL1` (garbage-collect all soft-deleted rows in scope, returns count). All paths honor `IsolationContext` and return `bool` (false = no matching row).
+- ✅ **Delete-aware search/recall** — `searchL1Fts`, `searchL1Hybrid` and `recall` filter `deleted = 0` rows, so soft-deleted memories never leak into recall.
+- ✅ **Schema migration** — `SqliteStore.init()` runs `migrateSchema()`: adds the `deleted` column (`ALTER TABLE ... ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`) to existing databases, guarded by a `PRAGMA table_info` probe so it runs at most once; builds `idx_l1_deleted` after the column is guaranteed to exist; and normalizes the legacy unguarded `l1_au` trigger to `AFTER UPDATE OF content` so soft delete/restore never churn the FTS index (migrateSchema is the single `l1_au` creation site — createSchema does not pre-create it, avoiding drop/recreate churn on fresh databases).
+- ✅ **Delete APIs through vtable + MemoryContext** — `MemoryStore.deleteL1`, `restoreL1`, `purgeDeletedL1` and `MemoryContext.delete/deleteHard/restore/purgeDeleted` delegate through the vtable.
+- ✅ **Recall** — `recall()` / `recallWithBudget()` aggregate L1 hits with `total_chars` budget tracking (L2/L3 aggregation was removed with those layers).
+- ✅ **Integration tests** (`test/sqlite_store_test.zig`) — 23 end-to-end tests: init/schema, L1 upsert+FTS, no-match, upsert-replaces, recall, vtable/MemoryContext round-trip, FTS-only hybrid, recallWithBudget capping, plus 11 delete/restore/purge/isolation tests (incl. hard-delete-force-removes-soft-deleted) and a legacy-DB migration test.
+- ✅ **Unit tests** — 16 tests in types.zig + rrf.zig + context.zig (MemoryType round-trip, IsolationContext whereClause, DeleteOptions defaults, RRF merge cases, MemoryContext delegation).
 
-**Total: 24 tests pass, 0 leaks.**
+**Total: 38 tests pass, 0 leaks.**
+
+_(Historical note: the original Phase 1 inventory — L0 capture/query, L2 scenario files, L3 persona, checkpoint get/set — was removed by the v0.4.x simplification commits `a902004`, `e3a1270`, `c6e22fb`; see Problem 8 below.)_
 
 ### Problems Found & Solutions
 
@@ -1614,13 +1690,23 @@ const bytes = std.mem.toBytes(v);
 
 **Solution:** Pass the full filename (including `.md`) to `readScenario`.
 
+#### Problem 8: Integration tests out of sync after the v0.4.2 simplification
+**Finding:** The commits that removed the L0 conversation layer, L2 scenario layer, L3 persona, and vector/embeddings support (`a902004`, `e3a1270`, `c6e22fb`, `1ebaaca`) changed `upsertL1` from a 3-arg to a 2-arg signature and deleted `setCheckpoint`/`getCheckpoint`/`searchL1Vector`, but `test/sqlite_store_test.zig` was not updated. `zig build test-integration` therefore failed to compile with 12 errors at the v0.4.2 tag (stale 3-arg `upsertL1` calls, references to removed checkpoint/vector APIs) — only `zig build test` (unit tests) was green.
+
+**Solution:** Rewrote the stale call sites in `test/sqlite_store_test.zig` to the current 2-arg `upsertL1(record, iso)` signature, dropped the tests for removed APIs (checkpoint round-trip, vector search, hybrid-with-embedding), and re-verified the suite end-to-end so `zig build test-all` is green again.
+
+#### Problem 9: Soft delete must not churn the FTS5 index
+**Finding:** A naive soft delete (`UPDATE deleted = 1`) fires the `l1_au` AFTER UPDATE trigger, which evicts and re-inserts the FTS5 entry. That is pointless index churn for a row that is being hidden, and a subsequent `restoreL1` (`UPDATE deleted = 0`) would fire it again.
+
+**Solution:** The existing `l1_au` trigger only fires when `content` changes. The soft-delete `UPDATE` touches only the `deleted` column, so with a trigger guarded as `AFTER UPDATE OF content` the FTS entry is untouched; soft-deleted rows are filtered at query time (`WHERE deleted = 0`). Hard delete keeps using the plain `l1_ad` AFTER DELETE trigger, which remains required.
+
 ### What's Deferred to Phase 2
 
-- **L1 extraction pipeline** — the `pipeline/` directory is in the structure but not yet implemented. This requires calling franky's `ai.registry.Registry` and is the "brain" of the memory system (see Section 4).
-- **Vector search** — `l1_embeddings` table exists in the schema and `upsertL1` can store embeddings, but `searchL1Vector` and brute-force cosine similarity (`vector.zig`) are not yet implemented. FTS-only mode works.
-- **Checkpoint JSON parsing** — `serializeCheckpoint` works, but `parseCheckpoint` is a stub returning empty. Phase 2 will use `std.json` for proper parsing.
-- **L0 FTS search** — `searchConversationFts` is implemented but not exposed via the vtable yet (only `searchL1` and `recall` are wired).
-- **Character budget capping** — `RecallResult.total_chars` is computed but not used to cap the injected context. Phase 2 will add a `max_chars` parameter to `recall()`.
+_(Re-baselined after the v0.4.2 simplification — the store is a single L1 layer now.)_
+
+- **L1 extraction pipeline** — deliberately dropped in favor of agent-driven saves (see Section 10): the agent IS the extractor; there is no `pipeline/` directory and none is planned.
+- **`memory_delete` / `restoreL1` / `purgeDeletedL1` tools in franky** — the store-side APIs are implemented (this document, §6.3/§6.4); wiring the `memory_delete` tool into the franky harness is Phase 2 work (§10.3, §10.8).
+- **Automated purge policy** — `purgeDeletedL1` is on-demand; an age-based sweep (e.g. purge soft-deleted rows older than N days via `updated_time`) is deferred until there is evidence it is needed.
 
 ### Build & Test Commands
 
@@ -1635,15 +1721,16 @@ zig build test-all     # Run all tests
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `src/types.zig` | 345 | Core types + isolation + tests |
-| `src/store.zig` | 175 | MemoryStore vtable interface |
-| `src/root.zig` | 42 | Public API re-exports |
-| `src/embedded/sqlite.zig` | 280 | SQLite C extern bindings |
-| `src/embedded/sqlite_store.zig` | 820 | SQLite store implementation |
-| `src/embedded/rrf.zig` | 250 | Reciprocal Rank Fusion + tests |
-| `test/sqlite_store_test.zig` | 465 | Integration tests (12 tests) |
-| `build.zig` | 80 | Build config + test targets |
-| **Total** | **~2457** | |
+| `src/types.zig` | 316 | Core types + isolation + `DeleteOptions` + tests |
+| `src/store.zig` | 108 | `MemoryStore` vtable interface (incl. delete/restore/purge) |
+| `src/root.zig` | 47 | Public API re-exports (incl. `DeleteOptions`, `sqlite` bindings) |
+| `src/context.zig` | 366 | `MemoryContext` + SqliteStore vtable adapter + tests |
+| `src/embedded/sqlite.zig` | 282 | SQLite C extern bindings |
+| `src/embedded/sqlite_store.zig` | 565 | SQLite store: L1 CRUD + FTS5 + delete/restore/purge + migration |
+| `src/embedded/rrf.zig` | 248 | Reciprocal Rank Fusion + tests |
+| `test/sqlite_store_test.zig` | 1005 | Integration tests (22 tests, incl. 11 delete/migration) |
+| `build.zig` | 122 | Build config + test targets |
+| **Total** | **~3059** | |
 
 ---
 
@@ -1800,6 +1887,58 @@ fn execute(...) !at.ToolResult {
     // Return "Saved: <content>" to agent
 }
 ```
+
+#### `memory_delete` tool
+
+The agent calls this to remove a memory — soft by default, hard on request.
+This is the counterpart to `memory_save`: memories go stale or turn out to
+be wrong, and without a delete path the store accumulates noise forever.
+
+```zig
+pub fn tool(ctx: *MemoryContext) at.AgentTool {
+    return .{
+        .name = "memory_delete",
+        .description =
+            "Delete a memory from persistent memory. Use this when a memory " ++
+            "is outdated, incorrect, or no longer relevant — a stale memory " ++
+            "that keeps getting recalled is worse than no memory. " ++
+            "By default the deletion is soft (the memory stops appearing in " ++
+            "search and recall but can be restored); set hard=true to " ++
+            "permanently remove it. Only delete memories that are wrong, " ++
+            "superseded, or explicitly unwanted — never delete a memory just " ++
+            "because it is currently not relevant.",
+        .parameters_json =
+            \\{"type":"object","required":["record_id"],"properties":{
+            \\  "record_id":{"type":"string","description":"ID of the memory to delete, as returned by memory_search"},
+            \\  "hard":{"type":"boolean","description":"Permanently remove (default false = soft delete, recoverable)","default":false}
+            \\}}
+        ,
+        .execution_mode = .parallel,
+        .ctx = @ptrCast(ctx),
+        .execute = execute,
+    };
+}
+
+fn execute(...) !at.ToolResult {
+    // Parse record_id, hard from args
+    // const options = DeleteOptions{ .soft = !hard };
+    // const deleted = ctx.store.deleteL1(record_id, options, ctx.iso)
+    //     catch return common.toolError(allocator, "delete_failed", "memory delete failed");
+    // if (!deleted) return "No memory found with id <record_id> (it may already be deleted, or it belongs to another scope)."
+    // Return "Deleted: <record_id>" to agent
+}
+```
+
+Notes on the tool semantics:
+
+- `record_id` comes from `memory_search` results, so the agent deletes by
+  reference, not by content — no fuzzy matching, no accidental deletion of
+  near-duplicates.
+- Soft-by-default matches the store default (`DeleteOptions{ .soft = true }`):
+  a wrong delete during a session can still be fixed by `restoreL1` / a
+  follow-up save with the same `record_id`.
+- Deleting a record that is already deleted (or missing) returns a clear
+  `false`/error string rather than failing, so the agent can recover.
 
 ### 10.4 Context Injection (Recall into System Prompt)
 
@@ -1972,12 +2111,13 @@ if (config.guardrails) |gr| {
 
 1. **`src/coding/tools/memory_search.zig`** — new tool, calls `store.searchL1Fts`.
 2. **`src/coding/tools/memory_save.zig`** — new tool, calls `store.upsertL1`.
-3. **`src/coding/memory.zig`** — integration module: `MemoryContext` setup, `buildMemoryContext()` for system prompt injection.
-4. **`src/coding/memory_guardrail.zig`** — optional guardrail that nudges the agent to save memory on `finish_task`.
-5. **`build.zig.zon`** — add `agent_memory` dependency.
-6. **`build.zig`** — add `agent_memory` module import.
-7. **Mode drivers** (`print.zig`, `interactive.zig`) — wire memory tools + context injection + guardrail.
-8. **System prompt** — add a section explaining the memory tools:
+3. **`src/coding/tools/memory_delete.zig`** — new tool, calls `store.deleteL1` (soft by default; `hard` arg maps to `DeleteOptions{ .soft = false }`). Pairs with the store's `restoreL1`/`purgeDeletedL1` for a maintenance path.
+4. **`src/coding/memory.zig`** — integration module: `MemoryContext` setup, `buildMemoryContext()` for system prompt injection.
+5. **`src/coding/memory_guardrail.zig`** — optional guardrail that nudges the agent to save memory on `finish_task`.
+6. **`build.zig.zon`** — add `agent_memory` dependency.
+7. **`build.zig`** — add `agent_memory` module import.
+8. **Mode drivers** (`print.zig`, `interactive.zig`) — wire memory tools + context injection + guardrail.
+9. **System prompt** — add a section explaining the memory tools:
 
 ```
 ## Memory Tools
@@ -1994,8 +2134,15 @@ You have access to persistent memory that survives across sessions:
   - Self-contained: makes sense without conversation context
   - User or AI centric: the subject is "User" or "AI"
 
+- **memory_delete**: Delete a memory that is wrong, outdated, or superseded.
+  Pass the record_id returned by memory_search. Deletion is soft by default
+  (recoverable); pass hard=true to remove it permanently. Never delete a
+  memory just because it is currently not relevant — stale memories are
+  the problem, not topical ones.
+
 When you finish a task, consider whether anything worth remembering happened.
-If so, save it with memory_save before calling finish_task.
+If so, save it with memory_save before calling finish_task. Likewise, if you
+notice an existing memory is now wrong, delete it with memory_delete.
 ```
 
 ### 10.8 Revised Phase 2 Roadmap
@@ -2005,28 +2152,42 @@ If so, save it with memory_save before calling finish_task.
    - Add `MemoryContext` struct (store + iso, no franky dependency).
    - Tests.
 
-2. **franky: memory_search + memory_save tools** (~1 day)
+2. **franky-memory: memory delete (soft + hard)** (~0.5 day)
+   - `DeleteOptions` type + `deleteL1` / `restoreL1` / `purgeDeletedL1` on
+     `SqliteStore`, wired through the vtable and `MemoryContext`.
+   - `deleted` column + idempotent `ALTER TABLE` migration in `init()`.
+   - Search/recall filter `deleted = 0`.
+   - Integration tests: soft delete hides from search, restore recovers,
+     hard delete removes row + FTS entry, purge, isolation mismatch,
+     upsert revives.
+
+3. **franky: memory_search + memory_save tools** (~1 day)
    - Two new tool files in `src/coding/tools/`.
    - Register in mode drivers.
    - System prompt section.
    - Tests with faux provider.
 
-3. **franky: context injection** (~0.5 day)
+4. **franky: memory_delete tool** (~0.5 day)
+   - `src/coding/tools/memory_delete.zig`, calls `store.deleteL1`.
+   - Register in mode drivers; extend the system prompt section.
+   - Tests with faux provider.
+
+5. **franky: context injection** (~0.5 day)
    - `buildMemoryContext()` in `src/coding/memory.zig`.
    - Call in `buildSystemPromptIo` (or before it).
    - Config: `--memory-db ~/.franky/memory.db`.
 
-4. **franky: memory guardrail** (~0.5 day)
+6. **franky: memory guardrail** (~0.5 day)
    - `MemoryGuardrail` in `src/coding/memory_guardrail.zig`.
    - Wire into loop's `betweenTurns`.
    - Config: `--memory-nudge` (default off).
 
-5. **franky: L0 capture** (~0.5 day)
+7. **franky: L0 capture** (~0.5 day)
    - Capture messages to L0 after each turn (cheap SQLite INSERT).
    - This gives the raw conversation log for future reference and
      potential offline extraction (if we ever add it back).
 
-Total: ~3 days for Phase 2, split across both repos.
+Total: ~3.5 days for Phase 2, split across both repos.
 
 ### 10.9 The Key Insight
 
