@@ -156,8 +156,7 @@ pub const SqliteStore = struct {
         options: types.DeleteOptions,
         iso: types.IsolationContext,
     ) !bool {
-        // The two paths differ only in the SQL statement; binds and the
-        // affected-row check are shared.
+        // The two paths differ only in the SQL statement.
         const sql = if (options.soft)
             "UPDATE l1_records SET deleted = 1 " ++
                 "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ? " ++
@@ -165,14 +164,7 @@ pub const SqliteStore = struct {
         else
             "DELETE FROM l1_records " ++
                 "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ?";
-        var stmt = try self.db.prepare(sql);
-        defer stmt.finalize();
-        try stmt.bindText(1, record_id);
-        try stmt.bindText(2, iso.team_id);
-        try stmt.bindText(3, iso.agent_id);
-        try stmt.bindText(4, iso.user_id);
-        _ = try stmt.step();
-        return self.db.changes() > 0;
+        return self.execRecordStatement(sql, record_id, iso);
     }
 
     /// Restore a soft-deleted L1 record (sets `deleted` back to 0).
@@ -183,10 +175,24 @@ pub const SqliteStore = struct {
         record_id: []const u8,
         iso: types.IsolationContext,
     ) !bool {
-        const sql =
+        return self.execRecordStatement(
             "UPDATE l1_records SET deleted = 0 " ++
-            "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ? " ++
-            "AND deleted = 1";
+                "WHERE record_id = ? AND team_id = ? AND agent_id = ? AND user_id = ? " ++
+                "AND deleted = 1",
+            record_id,
+            iso,
+        );
+    }
+
+    /// Execute a single-row, isolation-scoped statement (binds: record_id,
+    /// team_id, agent_id, user_id) and report whether a row was affected.
+    /// Shared by `deleteL1` and `restoreL1`.
+    fn execRecordStatement(
+        self: *SqliteStore,
+        sql: []const u8,
+        record_id: []const u8,
+        iso: types.IsolationContext,
+    ) !bool {
         var stmt = try self.db.prepare(sql);
         defer stmt.finalize();
         try stmt.bindText(1, record_id);
