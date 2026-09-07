@@ -30,6 +30,24 @@ pub const MemoryStore = struct {
             iso: types.IsolationContext,
         ) anyerror![]types.SearchResult,
 
+        delete_l1: *const fn (
+            ctx: *anyopaque,
+            record_id: []const u8,
+            options: types.DeleteOptions,
+            iso: types.IsolationContext,
+        ) anyerror!bool,
+
+        restore_l1: *const fn (
+            ctx: *anyopaque,
+            record_id: []const u8,
+            iso: types.IsolationContext,
+        ) anyerror!bool,
+
+        purge_deleted_l1: *const fn (
+            ctx: *anyopaque,
+            iso: types.IsolationContext,
+        ) anyerror!u32,
+
         // Recall
         recall: *const fn (
             ctx: *anyopaque,
@@ -63,6 +81,21 @@ pub const MemoryStore = struct {
 
     pub fn searchL1(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
         return self.vtable.search_l1(self.ctx, allocator, query, top_k, iso);
+    }
+
+    /// Delete an L1 record (soft by default). Returns true when a row was affected.
+    pub fn deleteL1(self: MemoryStore, record_id: []const u8, options: types.DeleteOptions, iso: types.IsolationContext) !bool {
+        return self.vtable.delete_l1(self.ctx, record_id, options, iso);
+    }
+
+    /// Restore a soft-deleted L1 record. Returns true when a row was revived.
+    pub fn restoreL1(self: MemoryStore, record_id: []const u8, iso: types.IsolationContext) !bool {
+        return self.vtable.restore_l1(self.ctx, record_id, iso);
+    }
+
+    /// Physically remove all soft-deleted records in scope. Returns the purge count.
+    pub fn purgeDeletedL1(self: MemoryStore, iso: types.IsolationContext) !u32 {
+        return self.vtable.purge_deleted_l1(self.ctx, iso);
     }
 
     pub fn recall(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {

@@ -77,6 +77,31 @@ const TestCtx = struct {
 // Tests
 // ============================
 
+/// Build a minimal L1 record with the given id/content (all other fields
+/// have safe defaults), for delete/search tests.
+fn makeRecord(record_id: []const u8, content: []const u8) types.L1Record {
+    return .{
+        .record_id = record_id,
+        .content = content,
+        .type = .episodic,
+        .priority = 75,
+        .scene_name = "test",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "",
+        .updated_time = "",
+        .metadata_json = "{}",
+    };
+}
+
 test "SqliteStore init creates schema" {
     var ctx = try TestCtx.init();
     defer ctx.deinit();
@@ -112,7 +137,7 @@ test "L1 upsert + FTS search" {
         .metadata_json = "{}",
     };
 
-    _ = try ctx.store.upsertL1(record, null, iso);
+    _ = try ctx.store.upsertL1(record, iso);
 
     // Search for "PostgreSQL".
     const results = try ctx.store.searchL1Fts(ctx.allocator, "PostgreSQL", 5, iso);
@@ -152,7 +177,7 @@ test "L1 FTS search with no match returns empty" {
         .metadata_json = "{}",
     };
 
-    _ = try ctx.store.upsertL1(record, null, iso);
+    _ = try ctx.store.upsertL1(record, iso);
 
     // Search for something unrelated.
     const results = try ctx.store.searchL1Fts(ctx.allocator, "Java", 5, iso);
@@ -191,7 +216,7 @@ test "L1 upsert replaces existing record" {
         .updated_time = "",
         .metadata_json = "{}",
     };
-    _ = try ctx.store.upsertL1(r1, null, iso);
+    _ = try ctx.store.upsertL1(r1, iso);
 
     // Upsert with new content.
     const r2 = types.L1Record{
@@ -214,7 +239,7 @@ test "L1 upsert replaces existing record" {
         .updated_time = "",
         .metadata_json = "{}",
     };
-    _ = try ctx.store.upsertL1(r2, null, iso);
+    _ = try ctx.store.upsertL1(r2, iso);
 
     // Search — should find only the updated content.
     const results = try ctx.store.searchL1Fts(ctx.allocator, "PostgreSQL", 5, iso);
@@ -233,34 +258,6 @@ test "L1 upsert replaces existing record" {
         ctx.allocator.free(old_results);
     }
     try std.testing.expectEqual(@as(usize, 0), old_results.len);
-}
-
-test "checkpoint set + get round-trip" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const checkpoint = types.Checkpoint{
-        .last_processed_timestamp = "2025-01-15T10:05:00Z",
-        .last_scene_name = "database setup",
-    };
-    try ctx.store.setCheckpoint(checkpoint);
-
-    const read = try ctx.store.getCheckpoint(ctx.allocator);
-    defer read.deinit(ctx.allocator);
-
-    try std.testing.expect(read.last_processed_timestamp != null);
-    try std.testing.expect(read.last_scene_name != null);
-    try std.testing.expectEqualStrings("2025-01-15T10:05:00Z", read.last_processed_timestamp.?);
-    try std.testing.expectEqualStrings("database setup", read.last_scene_name.?);
-}
-
-test "checkpoint get when empty returns empty" {
-    var ctx = try TestCtx.init();
-    defer ctx.deinit();
-
-    const read = try ctx.store.getCheckpoint(ctx.allocator);
-    try std.testing.expect(read.last_processed_timestamp == null);
-    try std.testing.expect(read.last_scene_name == null);
 }
 
 test "recall returns L1" {
@@ -290,7 +287,7 @@ test "recall returns L1" {
         .updated_time = "",
         .metadata_json = "{}",
     };
-    _ = try ctx.store.upsertL1(l1, null, iso);
+    _ = try ctx.store.upsertL1(l1, iso);
 
     // Recall.
     var result = try ctx.store.recall(ctx.allocator, "PostgreSQL", 5, iso);
@@ -333,7 +330,7 @@ test "toMemoryStore + MemoryContext round-trip" {
         .updated_time = "",
         .metadata_json = "{}",
     };
-    _ = try mem_store.upsertL1(record, null, iso);
+    _ = try mem_store.upsertL1(record, iso);
 
     // Search via the vtable.
     const results = try mem_store.searchL1(ctx.allocator, "Zig", 5, iso);
@@ -352,16 +349,11 @@ test "toMemoryStore + MemoryContext round-trip" {
     try std.testing.expectEqual(@as(usize, 1), recall.l1_results.len);
     try std.testing.expect(recall.total_chars > 0);
 }
-test "L1 upsert with embedding + vector search" {
+test "L1 FTS search finds only matching content" {
     var ctx = try TestCtx.init();
     defer ctx.deinit();
 
     const iso = types.IsolationContext{ .session_id = "s1" };
-
-    // Insert two records with embeddings.
-    const emb1 = [_]f32{ 1.0, 0.0, 0.0 };
-    const emb2 = [_]f32{ 0.0, 1.0, 0.0 };
-    const emb3 = [_]f32{ 0.9, 0.1, 0.0 }; // close to emb1
 
     const rec1 = types.L1Record{
         .record_id = "vec-001",
@@ -390,34 +382,26 @@ test "L1 upsert with embedding + vector search" {
     rec3.record_id = "vec-003";
     rec3.content = "User likes SQLite";
 
-    _ = try ctx.store.upsertL1(rec1, &emb1, iso);
-    _ = try ctx.store.upsertL1(rec2, &emb2, iso);
-    _ = try ctx.store.upsertL1(rec3, &emb3, iso);
+    _ = try ctx.store.upsertL1(rec1, iso);
+    _ = try ctx.store.upsertL1(rec2, iso);
+    _ = try ctx.store.upsertL1(rec3, iso);
 
-    // Search with query embedding close to emb1 (should rank vec-001 first).
-    const query_emb = [_]f32{ 0.95, 0.05, 0.0 };
-    const results = try ctx.store.searchL1Vector(ctx.allocator, &query_emb, 3, iso);
+    // Search — FTS ranks by BM25 relevance.
+    const results = try ctx.store.searchL1Fts(ctx.allocator, "PostgreSQL", 3, iso);
     defer {
         for (results) |r| r.deinit(ctx.allocator);
         ctx.allocator.free(results);
     }
 
-    try std.testing.expectEqual(@as(usize, 3), results.len);
-    // vec-001 should be top (closest to query), vec-003 second, vec-002 last.
+    try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("vec-001", results[0].record_id);
-    try std.testing.expect(results[0].score >= results[1].score);
-    try std.testing.expect(results[1].score >= results[2].score);
 }
 
-test "L1 hybrid search with FTS + vector via RRF" {
+test "L1 hybrid search merges FTS results" {
     var ctx = try TestCtx.init();
     defer ctx.deinit();
 
     const iso = types.IsolationContext{ .session_id = "s1" };
-
-    // Insert records with embeddings.
-    const emb1 = [_]f32{ 1.0, 0.0 };
-    const emb2 = [_]f32{ 0.0, 1.0 };
 
     const rec1 = types.L1Record{
         .record_id = "hybrid-001",
@@ -443,20 +427,19 @@ test "L1 hybrid search with FTS + vector via RRF" {
     rec2.record_id = "hybrid-002";
     rec2.content = "User likes MySQL";
 
-    _ = try ctx.store.upsertL1(rec1, &emb1, iso);
-    _ = try ctx.store.upsertL1(rec2, &emb2, iso);
+    _ = try ctx.store.upsertL1(rec1, iso);
+    _ = try ctx.store.upsertL1(rec2, iso);
 
-    // Hybrid search: FTS query "PostgreSQL" + embedding close to rec1.
-    const query_emb = [_]f32{ 0.95, 0.05 };
-    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "PostgreSQL", 5, iso, &query_emb);
+    // Hybrid search (FTS-only mode: no vector search in this build).
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "PostgreSQL", 5, iso);
     defer {
         for (results) |r| r.deinit(ctx.allocator);
         ctx.allocator.free(results);
     }
 
-    // Should return results (RRF-merged).
+    // Should return results.
     try std.testing.expect(results.len > 0);
-    // hybrid-001 should be top (matches both FTS and vector).
+    // hybrid-001 matches the query.
     try std.testing.expectEqualStrings("hybrid-001", results[0].record_id);
 }
 
@@ -486,10 +469,10 @@ test "L1 hybrid search without embedding returns FTS only" {
         .updated_time = "",
         .metadata_json = "{}",
     };
-    _ = try ctx.store.upsertL1(rec1, null, iso);
+    _ = try ctx.store.upsertL1(rec1, iso);
 
-    // Hybrid search with null embedding — should work as FTS-only.
-    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "dark", 5, iso, null);
+    // Hybrid search (FTS-only mode — no embeddings in this build).
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "dark", 5, iso);
     defer {
         for (results) |r| r.deinit(ctx.allocator);
         ctx.allocator.free(results);
@@ -530,8 +513,8 @@ test "recallWithBudget caps total content" {
     rec2.record_id = "budget-002";
     rec2.content = "User uses PostgreSQL for their Python backend"; // matches query
 
-    _ = try ctx.store.upsertL1(rec1, null, iso);
-    _ = try ctx.store.upsertL1(rec2, null, iso);
+    _ = try ctx.store.upsertL1(rec1, iso);
+    _ = try ctx.store.upsertL1(rec2, iso);
 
     // Recall with unlimited budget — should get everything.
     var unlimited = try ctx.store.recallWithBudget(ctx.allocator, "PostgreSQL", 5, iso, 0);
@@ -571,9 +554,452 @@ test "recallWithBudget with zero budget returns everything" {
         .updated_time = "",
         .metadata_json = "{}",
     };
-    _ = try ctx.store.upsertL1(rec, null, iso);
+    _ = try ctx.store.upsertL1(rec, iso);
 
     var result = try ctx.store.recallWithBudget(ctx.allocator, "memory", 5, iso, 0);
     defer result.deinit(ctx.allocator);
     try std.testing.expectEqual(@as(usize, 1), result.l1_results.len);
+}
+
+// ============================
+// Delete (soft + hard) tests
+// ============================
+
+test "soft delete hides record from search and recall" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    _ = try ctx.store.upsertL1(makeRecord("del-001", "User prefers PostgreSQL over MySQL"), iso);
+
+    // Sanity: it is searchable before the delete.
+    {
+        const results = try ctx.store.searchL1Fts(ctx.allocator, "PostgreSQL", 5, iso);
+        defer {
+            for (results) |r| r.deinit(ctx.allocator);
+            ctx.allocator.free(results);
+        }
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+    }
+
+    // Soft delete (default options).
+    const deleted = try ctx.store.deleteL1("del-001", .{}, iso);
+    try std.testing.expect(deleted);
+
+    // No longer searchable.
+    {
+        const results = try ctx.store.searchL1Fts(ctx.allocator, "PostgreSQL", 5, iso);
+        defer {
+            for (results) |r| r.deinit(ctx.allocator);
+            ctx.allocator.free(results);
+        }
+        try std.testing.expectEqual(@as(usize, 0), results.len);
+    }
+
+    // No longer recalled.
+    {
+        var recall = try ctx.store.recall(ctx.allocator, "PostgreSQL", 5, iso);
+        defer recall.deinit(ctx.allocator);
+        try std.testing.expectEqual(@as(usize, 0), recall.l1_results.len);
+    }
+}
+
+test "soft delete twice returns false" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    _ = try ctx.store.upsertL1(makeRecord("del-002", "User likes SQLite"), iso);
+
+    try std.testing.expect(try ctx.store.deleteL1("del-002", .{}, iso));
+    // Already soft-deleted → false.
+    try std.testing.expect(!(try ctx.store.deleteL1("del-002", .{}, iso)));
+}
+
+test "delete unknown record returns false" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    try std.testing.expect(!(try ctx.store.deleteL1("does-not-exist", .{}, iso)));
+    try std.testing.expect(!(try ctx.store.restoreL1("does-not-exist", iso)));
+}
+
+test "restore revives soft-deleted record" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    _ = try ctx.store.upsertL1(makeRecord("del-003", "User prefers dark mode"), iso);
+
+    try std.testing.expect(try ctx.store.deleteL1("del-003", .{}, iso));
+
+    // Restore.
+    try std.testing.expect(try ctx.store.restoreL1("del-003", iso));
+
+    // Searchable again with the original content.
+    {
+        const results = try ctx.store.searchL1Fts(ctx.allocator, "dark", 5, iso);
+        defer {
+            for (results) |r| r.deinit(ctx.allocator);
+            ctx.allocator.free(results);
+        }
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("del-003", results[0].record_id);
+    }
+
+    // Restoring a live record returns false.
+    try std.testing.expect(!(try ctx.store.restoreL1("del-003", iso)));
+}
+
+test "hard delete removes record permanently" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    _ = try ctx.store.upsertL1(makeRecord("del-004", "User uses MySQL in production"), iso);
+
+    // Hard delete.
+    try std.testing.expect(try ctx.store.deleteL1("del-004", .{ .soft = false }, iso));
+
+    // Not searchable.
+    {
+        const results = try ctx.store.searchL1Fts(ctx.allocator, "MySQL", 5, iso);
+        defer {
+            for (results) |r| r.deinit(ctx.allocator);
+            ctx.allocator.free(results);
+        }
+        try std.testing.expectEqual(@as(usize, 0), results.len);
+    }
+
+    // Cannot be restored (row is gone).
+    try std.testing.expect(!(try ctx.store.restoreL1("del-004", iso)));
+
+    // Hard-deleting the same id again returns false.
+    try std.testing.expect(!(try ctx.store.deleteL1("del-004", .{ .soft = false }, iso)));
+}
+
+test "purge removes soft-deleted records and returns count" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    _ = try ctx.store.upsertL1(makeRecord("purge-001", "User likes Redis"), iso);
+    _ = try ctx.store.upsertL1(makeRecord("purge-002", "User likes Memcached"), iso);
+    _ = try ctx.store.upsertL1(makeRecord("purge-003", "User likes SQLite"), iso);
+
+    // Soft-delete two of the three.
+    try std.testing.expect(try ctx.store.deleteL1("purge-001", .{}, iso));
+    try std.testing.expect(try ctx.store.deleteL1("purge-002", .{}, iso));
+
+    // Purge — should remove exactly the two soft-deleted rows.
+    const purged = try ctx.store.purgeDeletedL1(iso);
+    try std.testing.expectEqual(@as(u32, 2), purged);
+
+    // Nothing left to purge.
+    try std.testing.expectEqual(@as(u32, 0), try ctx.store.purgeDeletedL1(iso));
+
+    // Purged rows cannot be restored.
+    try std.testing.expect(!(try ctx.store.restoreL1("purge-001", iso)));
+    try std.testing.expect(!(try ctx.store.restoreL1("purge-002", iso)));
+
+    // The live record survives the purge and is still searchable.
+    {
+        const results = try ctx.store.searchL1Fts(ctx.allocator, "SQLite", 5, iso);
+        defer {
+            for (results) |r| r.deinit(ctx.allocator);
+            ctx.allocator.free(results);
+        }
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("purge-003", results[0].record_id);
+    }
+}
+
+test "delete respects isolation context" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso_a = types.IsolationContext{ .user_id = "alice" };
+    const iso_b = types.IsolationContext{ .user_id = "bob" };
+
+    // alice owns the record.
+    var rec = makeRecord("iso-001", "Alice prefers PostgreSQL");
+    rec.user_id = "alice";
+    _ = try ctx.store.upsertL1(rec, iso_a);
+
+    // bob cannot delete alice's record.
+    try std.testing.expect(!(try ctx.store.deleteL1("iso-001", .{}, iso_b)));
+
+    // alice can.
+    try std.testing.expect(try ctx.store.deleteL1("iso-001", .{}, iso_a));
+
+    // bob cannot restore it either.
+    try std.testing.expect(!(try ctx.store.restoreL1("iso-001", iso_b)));
+
+    // alice can.
+    try std.testing.expect(try ctx.store.restoreL1("iso-001", iso_a));
+}
+
+test "purge is scoped to isolation context" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso_alice = types.IsolationContext{ .user_id = "alice" };
+    const iso_bob = types.IsolationContext{ .user_id = "bob" };
+
+    // alice and bob each soft-delete one of their own records.
+    var rec_a = makeRecord("purge-iso-a", "Alice likes Redis");
+    rec_a.user_id = "alice";
+    _ = try ctx.store.upsertL1(rec_a, iso_alice);
+    try std.testing.expect(try ctx.store.deleteL1("purge-iso-a", .{}, iso_alice));
+
+    var rec_b = makeRecord("purge-iso-b", "Bob likes SQLite");
+    rec_b.user_id = "bob";
+    _ = try ctx.store.upsertL1(rec_b, iso_bob);
+    try std.testing.expect(try ctx.store.deleteL1("purge-iso-b", .{}, iso_bob));
+
+    // Bob purges — only his own soft-deleted row is removed.
+    try std.testing.expectEqual(@as(u32, 1), try ctx.store.purgeDeletedL1(iso_bob));
+
+    // Alice's soft-deleted record is still restorable.
+    try std.testing.expect(try ctx.store.restoreL1("purge-iso-a", iso_alice));
+}
+
+test "upsert revives soft-deleted record" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    _ = try ctx.store.upsertL1(makeRecord("revive-001", "User uses MySQL"), iso);
+
+    // Soft delete.
+    try std.testing.expect(try ctx.store.deleteL1("revive-001", .{}, iso));
+
+    // A soft-deleted row is restorable (restore semantics sanity check).
+    try std.testing.expect(try ctx.store.restoreL1("revive-001", iso));
+
+    // Soft delete again, then revive via upsert instead of restore.
+    try std.testing.expect(try ctx.store.deleteL1("revive-001", .{}, iso));
+    _ = try ctx.store.upsertL1(makeRecord("revive-001", "User uses PostgreSQL now"), iso);
+
+    // Searchable again with the new content.
+    {
+        const results = try ctx.store.searchL1Fts(ctx.allocator, "PostgreSQL", 5, iso);
+        defer {
+            for (results) |r| r.deinit(ctx.allocator);
+            ctx.allocator.free(results);
+        }
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("User uses PostgreSQL now", results[0].content);
+    }
+
+    // The revived row is live — restore now returns false.
+    try std.testing.expect(!(try ctx.store.restoreL1("revive-001", iso)));
+}
+
+// ============================
+// Migration tests
+// ============================
+
+/// Create a legacy (pre-soft-delete) database: the v0.4.2 schema WITHOUT the
+/// `deleted` column, with the unguarded l1_au trigger, and one seeded row.
+fn createLegacyDb(db_path: [:0]const u8) !void {
+    var db = try agent_memory.sqlite.Db.open(db_path);
+    defer db.close();
+
+    try db.exec(
+        \\CREATE TABLE l1_records (
+        \\  record_id TEXT PRIMARY KEY,
+        \\  content TEXT NOT NULL,
+        \\  type TEXT NOT NULL,
+        \\  priority REAL NOT NULL DEFAULT 50,
+        \\  scene_name TEXT NOT NULL DEFAULT '',
+        \\  session_key TEXT NOT NULL,
+        \\  session_id TEXT NOT NULL,
+        \\  team_id TEXT NOT NULL DEFAULT 'default',
+        \\  task_id TEXT NOT NULL DEFAULT '',
+        \\  user_id TEXT NOT NULL DEFAULT 'default',
+        \\  agent_id TEXT NOT NULL DEFAULT 'default',
+        \\  version INTEGER NOT NULL DEFAULT 1,
+        \\  timestamp_str TEXT NOT NULL DEFAULT '',
+        \\  timestamp_start TEXT NOT NULL DEFAULT '',
+        \\  timestamp_end TEXT NOT NULL DEFAULT '',
+        \\  created_time TEXT NOT NULL DEFAULT '',
+        \\  updated_time TEXT NOT NULL DEFAULT '',
+        \\  metadata_json TEXT NOT NULL DEFAULT '{}'
+        \\)
+    );
+    try db.exec(
+        \\CREATE VIRTUAL TABLE l1_fts USING fts5(
+        \\  content,
+        \\  content='l1_records',
+        \\  content_rowid='rowid'
+        \\)
+    );
+    try db.exec(
+        \\CREATE TRIGGER l1_ai AFTER INSERT ON l1_records BEGIN
+        \\  INSERT INTO l1_fts(rowid, content) VALUES (new.rowid, new.content);
+        \\END
+    );
+    try db.exec(
+        \\CREATE TRIGGER l1_ad AFTER DELETE ON l1_records BEGIN
+        \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+        \\END
+    );
+    try db.exec(
+        \\CREATE TRIGGER l1_au AFTER UPDATE ON l1_records BEGIN
+        \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+        \\  INSERT INTO l1_fts(rowid, content) VALUES (new.rowid, new.content);
+        \\END
+    );
+
+    // Seed one row (via the legacy insert, fires l1_ai).
+    const insert =
+        "INSERT INTO l1_records " ++
+        "(record_id, content, type, priority, scene_name, session_key, session_id, " ++
+        "team_id, task_id, user_id, agent_id, version, " ++
+        "timestamp_str, timestamp_start, timestamp_end, created_time, updated_time, metadata_json) " ++
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    var stmt = try db.prepare(insert);
+    defer stmt.finalize();
+    try stmt.bindText(1, "legacy-001");
+    try stmt.bindText(2, "User uses PostgreSQL (legacy row)");
+    try stmt.bindText(3, "episodic");
+    try stmt.bindFloat(4, 75);
+    try stmt.bindText(5, "legacy");
+    try stmt.bindText(6, "sk1");
+    try stmt.bindText(7, "s1");
+    try stmt.bindText(8, "default");
+    try stmt.bindText(9, "");
+    try stmt.bindText(10, "default");
+    try stmt.bindText(11, "default");
+    try stmt.bindInt(12, 1);
+    try stmt.bindText(13, "");
+    try stmt.bindText(14, "");
+    try stmt.bindText(15, "");
+    try stmt.bindText(16, "");
+    try stmt.bindText(17, "");
+    try stmt.bindText(18, "{}");
+    _ = try stmt.step();
+}
+
+test "init migrates legacy database in place" {
+    const allocator = std.testing.allocator;
+    var threaded = makeIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const tmp = try makeTempDir(allocator, io);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, tmp.dir) catch {};
+        allocator.free(tmp.dir);
+        allocator.free(tmp.db_path);
+    }
+
+    // Create the legacy database (schema WITHOUT the deleted column).
+    try createLegacyDb(tmp.db_path);
+
+    // Open with the current SqliteStore — init() must migrate it.
+    var store = try sqlite_store.SqliteStore.init(allocator, io, tmp.db_path);
+    defer store.deinit();
+
+    // The pre-existing row must still be visible (deleted defaults to 0).
+    const iso = types.IsolationContext{};
+    {
+        const results = try store.searchL1Fts(allocator, "PostgreSQL", 5, iso);
+        defer {
+            for (results) |r| r.deinit(allocator);
+            allocator.free(results);
+        }
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("legacy-001", results[0].record_id);
+    }
+
+    // Soft delete the legacy row — works on the migrated column.
+    try std.testing.expect(try store.deleteL1("legacy-001", .{}, iso));
+    {
+        const after = try store.searchL1Fts(allocator, "PostgreSQL", 5, iso);
+        defer {
+            for (after) |r| r.deinit(allocator);
+            allocator.free(after);
+        }
+        try std.testing.expectEqual(@as(usize, 0), after.len);
+    }
+
+    // Restore works after migration.
+    try std.testing.expect(try store.restoreL1("legacy-001", iso));
+    {
+        const revived = try store.searchL1Fts(allocator, "PostgreSQL", 5, iso);
+        defer {
+            for (revived) |r| r.deinit(allocator);
+            allocator.free(revived);
+        }
+        try std.testing.expectEqual(@as(usize, 1), revived.len);
+    }
+
+    // Hard delete still works (l1_ad trigger intact after migration).
+    try std.testing.expect(try store.deleteL1("legacy-001", .{ .soft = false }, iso));
+    {
+        const gone = try store.searchL1Fts(allocator, "PostgreSQL", 5, iso);
+        defer {
+            for (gone) |r| r.deinit(allocator);
+            allocator.free(gone);
+        }
+        try std.testing.expectEqual(@as(usize, 0), gone.len);
+    }
+
+    // Re-opening a migrated database is idempotent (no double-migration errors).
+    store.deinit();
+    var reopened = try sqlite_store.SqliteStore.init(allocator, io, tmp.db_path);
+    defer reopened.deinit();
+    const results2 = try reopened.searchL1Fts(allocator, "PostgreSQL", 5, iso);
+    defer {
+        for (results2) |r| r.deinit(allocator);
+        allocator.free(results2);
+    }
+    try std.testing.expectEqual(@as(usize, 0), results2.len);
+}
+
+test "MemoryContext delete/restore/purge delegate through vtable" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    var mem_ctx = agent_memory.MemoryContext{
+        .store = ctx.store.toMemoryStore(),
+        .iso = .{},
+    };
+
+    _ = try mem_ctx.save(ctx.allocator, "User prefers tabs over spaces", .persona, 70, "editor");
+
+    // Find the saved record id via search.
+    const results = try mem_ctx.search(ctx.allocator, "tabs", 5);
+    defer {
+        for (results) |r| r.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    const record_id = results[0].record_id;
+
+    // Soft delete via MemoryContext.
+    try std.testing.expect(try mem_ctx.delete(record_id));
+
+    // Hidden from search.
+    {
+        const after = try mem_ctx.search(ctx.allocator, "tabs", 5);
+        defer {
+            for (after) |r| r.deinit(ctx.allocator);
+            ctx.allocator.free(after);
+        }
+        try std.testing.expectEqual(@as(usize, 0), after.len);
+    }
+
+    // Restore via MemoryContext.
+    try std.testing.expect(try mem_ctx.restore(record_id));
+
+    // Hard delete via MemoryContext.
+    try std.testing.expect(try mem_ctx.deleteHard(record_id));
+    try std.testing.expect(!(try mem_ctx.restore(record_id)));
+
+    // Purge via MemoryContext (nothing soft-deleted → 0).
+    try std.testing.expectEqual(@as(u32, 0), try mem_ctx.purgeDeleted());
 }

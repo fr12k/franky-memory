@@ -197,6 +197,21 @@ pub const L1QueryFilter = struct {
 };
 
 // ============================
+// Delete Options
+// ============================
+
+/// Options for deleting an L1 memory record.
+///
+/// Soft delete (the default) marks the record `deleted = 1`: the row is kept
+/// (recoverable via `restoreL1`), but it disappears from search and recall.
+/// Hard delete physically removes the row — irreversible.
+pub const DeleteOptions = struct {
+    /// When true (default), soft-delete the record (recoverable).
+    /// When false, hard-delete it (row removed, FTS entry evicted).
+    soft: bool = true,
+};
+
+// ============================
 // Checkpoint
 // ============================
 
@@ -292,4 +307,11 @@ test "IsolationContext whereClause with session_id and task_id" {
         buf.items,
     );
     try std.testing.expectEqual(@as(usize, 5), iso.whereParamCount());
+}
+
+test "DeleteOptions defaults to soft delete" {
+    const opts = DeleteOptions{};
+    try std.testing.expect(opts.soft);
+    const hard = DeleteOptions{ .soft = false };
+    try std.testing.expect(!hard.soft);
 }

@@ -103,6 +103,30 @@ pub const MemoryContext = struct {
     pub fn recallWithBudget(self: *MemoryContext, allocator: std.mem.Allocator, query: []const u8, top_k: u32, max_chars: usize) !types.RecallResult {
         return self.store.recallWithBudget(allocator, query, top_k, self.iso, max_chars);
     }
+
+    /// Soft-delete a memory (default semantics, see `DeleteOptions`).
+    /// The record disappears from search/recall but can be restored with
+    /// `restore`. Returns true when a row was affected.
+    pub fn delete(self: *MemoryContext, record_id: []const u8) !bool {
+        return self.store.deleteL1(record_id, .{}, self.iso);
+    }
+
+    /// Hard-delete a memory — the row is physically removed and cannot be
+    /// restored. Returns true when a row was affected.
+    pub fn deleteHard(self: *MemoryContext, record_id: []const u8) !bool {
+        return self.store.deleteL1(record_id, .{ .soft = false }, self.iso);
+    }
+
+    /// Restore a soft-deleted memory. Returns true when a row was revived.
+    pub fn restore(self: *MemoryContext, record_id: []const u8) !bool {
+        return self.store.restoreL1(record_id, self.iso);
+    }
+
+    /// Physically remove all soft-deleted memories in this isolation scope.
+    /// Returns the number of purged rows.
+    pub fn purgeDeleted(self: *MemoryContext) !u32 {
+        return self.store.purgeDeletedL1(self.iso);
+    }
 };
 
 // ============================
@@ -116,6 +140,9 @@ pub const SqliteStoreVTable = store_mod.MemoryStore.VTable{
     .capabilities = vtableCapabilities,
     .upsert_l1 = vtableUpsertL1,
     .search_l1 = vtableSearchL1,
+    .delete_l1 = vtableDeleteL1,
+    .restore_l1 = vtableRestoreL1,
+    .purge_deleted_l1 = vtablePurgeDeletedL1,
     .recall = vtableRecall,
     .recall_with_budget = vtableRecallWithBudget,
 };
@@ -138,6 +165,21 @@ fn vtableUpsertL1(ctx: *anyopaque, record: types.L1Record, iso: types.IsolationC
 fn vtableSearchL1(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
     return self.searchL1Hybrid(allocator, query, top_k, iso);
+}
+
+fn vtableDeleteL1(ctx: *anyopaque, record_id: []const u8, options: types.DeleteOptions, iso: types.IsolationContext) !bool {
+    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
+    return self.deleteL1(record_id, options, iso);
+}
+
+fn vtableRestoreL1(ctx: *anyopaque, record_id: []const u8, iso: types.IsolationContext) !bool {
+    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
+    return self.restoreL1(record_id, iso);
+}
+
+fn vtablePurgeDeletedL1(ctx: *anyopaque, iso: types.IsolationContext) !u32 {
+    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
+    return self.purgeDeletedL1(iso);
 }
 
 fn vtableRecall(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
