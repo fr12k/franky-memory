@@ -1024,6 +1024,11 @@ Design decisions:
 - **`upsertL1` revives:** upserting a `record_id` that is soft-deleted
   re-inserts it with `deleted = 0` (the delete+insert upsert pattern clears
   the flag), so saving a memory again is equivalent to restore.
+- **Trigger guard + migration normalization.** The `l1_au` trigger is declared
+  as `AFTER UPDATE OF content`, so flag-only `UPDATE`s (soft delete/restore)
+  never touch the FTS index. Databases created before this change carry an
+  unguarded `l1_au`; `init()`'s migration drops and recreates it with the
+  guard, so fresh and migrated databases behave identically.
 - **Isolation always applies.** Every statement carries the `team_id /
   agent_id / user_id` predicates from `IsolationContext`, so a tenant can
   never delete or purge another tenant's memories.
@@ -1538,18 +1543,10 @@ pub const MemoryIntegration = struct {
 
 ### SQLite Schema (Summary)
 
-```sql
--- L0: raw conversations
-CREATE TABLE l0_conversations (
-  record_id TEXT PRIMARY KEY,
-  session_key TEXT, session_id TEXT,
-  team_id TEXT, user_id TEXT, agent_id TEXT, task_id TEXT,
-  role TEXT, message_text TEXT,
-  recorded_at TEXT, timestamp INTEGER
-);
-CREATE VIRTUAL TABLE l0_fts USING fts5(message_text, content='l0_conversations');
+_(Re-baselined to the v0.4.2 single-L1 design: the L0 conversation layer, L2 scenario files, L3 persona file, embeddings table, and pipeline checkpoint were removed in the v0.4.x simplification. The `deleted` column is the v0.5 soft-delete addition.)_
 
--- L1: structured memories
+```sql
+-- L1: structured memories — the only table
 CREATE TABLE l1_records (
   record_id TEXT PRIMARY KEY,
   content TEXT, type TEXT, priority REAL, scene_name TEXT,
@@ -1557,33 +1554,27 @@ CREATE TABLE l1_records (
   team_id TEXT, task_id TEXT, user_id TEXT, agent_id TEXT,
   version INTEGER, timestamp_str TEXT, timestamp_start TEXT, timestamp_end TEXT,
   created_time TEXT, updated_time TEXT, metadata_json TEXT,
-  deleted INTEGER NOT NULL DEFAULT 0
+  deleted INTEGER NOT NULL DEFAULT 0      -- 1 = soft-deleted (hidden, restorable)
 );
-CREATE VIRTUAL TABLE l1_fts USING fts5(content, content='l1_records');
+CREATE INDEX idx_l1_session ON l1_records(session_id);
+CREATE INDEX idx_l1_type    ON l1_records(type);
+CREATE INDEX idx_l1_deleted  ON l1_records(deleted);
 
--- L1 embeddings (optional)
-CREATE TABLE l1_embeddings (
-  record_id TEXT PRIMARY KEY,
-  embedding BLOB, dimensions INTEGER, provider TEXT, model TEXT
-);
+-- L1 full-text search (contentless external-content FTS5)
+CREATE VIRTUAL TABLE l1_fts USING fts5(content, content='l1_records', content_rowid='rowid');
 
--- Pipeline checkpoint
-CREATE TABLE pipeline_checkpoint (key TEXT PRIMARY KEY, value TEXT);
+-- FTS sync triggers (created when FTS5 is available):
+--   l1_ai  AFTER INSERT ON l1_records            → add FTS row
+--   l1_ad  AFTER DELETE ON l1_records             → evict FTS row (hard delete path)
+--   l1_au  AFTER UPDATE OF content ON l1_records  → evict+re-add on content change only;
+--        soft delete/restore (deleted-flag UPDATEs) intentionally do NOT fire it
 ```
 
 ### File Layout
 
 ```
 ~/.franky/memory/
-├── memory.db                    ← SQLite (L0 + L1 tables)
-├── scene_blocks/                ← L2 markdown files
-│   ├── debugging-auth-module.md
-│   ├── setting-up-postgres.md
-│   └── ...
-├── persona.md                   ← L3 persona
-└── .metadata/
-    ├── checkpoint.json           ← pipeline cursor
-    └── scene_index.json          ← scene name → file mapping
+└── memory.db                    ← SQLite (l1_records + l1_fts)
 ```
 
 ### Memory Types
@@ -1596,14 +1587,10 @@ CREATE TABLE pipeline_checkpoint (key TEXT PRIMARY KEY, value TEXT);
 
 ### Recall Result Format (injected into system prompt)
 
+_(Re-baselined to the single-L1 layer: the L3 persona and L2 scenario blocks were removed in the v0.4.x simplification; only the relevant-facts list remains, capped by `recallWithBudget`.)_
+
 ```
 <memory_context>
-## Persona
-User's name is Alice. Prefers concise answers. Uses PostgreSQL.
-
-## Current Scenario
-debugging auth module — found nil pointer in middleware, adding tests.
-
 ## Relevant Facts
 - [episodic, p=75] User decided to use PostgreSQL for their database
 - [instruction, p=80] User wants tests added when fixing bugs
@@ -1626,33 +1613,31 @@ _Updated during Phase 1 implementation._
 
 ### What's Done
 
-Phase 1 (Storage + Retrieval data plane) is **complete and tested**:
+Phase 1 (Storage + Retrieval data plane) is **complete and tested**; the v0.4.x simplification reduced the store to a single L1 layer, and v0.5 adds deletion:
 
-- ✅ **Core types** (`src/types.zig`) — `MemoryType`, `IsolationContext`, `L0Record`, `L1Record`, `SearchResult`, `StoreCapabilities`, `RecallResult`, `ScenarioFile`, `Checkpoint`, `DedupDecision`, query filters. All with `deinit()` and round-trip tests.
+- ✅ **Core types** (`src/types.zig`) — `MemoryType`, `IsolationContext`, `L1Record`, `SearchResult`, `StoreCapabilities`, `RecallResult`, `Checkpoint`, `DedupDecision`, `L1QueryFilter`, `DeleteOptions`. With `deinit()` and round-trip tests. (`L0Record`/`ScenarioFile` were removed with their layers.)
 - ✅ **Isolation** — five-dimensional tenancy (team/user/agent/session/task) with `whereClause()` SQL builder. Defaults to `"default"` for single-user mode.
-- ✅ **SQLite C bindings** (`src/embedded/sqlite.zig`) — manual extern declarations (no `@cImport` in Zig 0.17-dev). Wraps `sqlite3_open_v2`, `exec`, `prepare_v2`, `step`, `bind_*`, `column_*`, `close`, `busy_timeout`, `errmsg`. ~280 lines.
-- ✅ **SQLite store** (`src/embedded/sqlite_store.zig`) — full L0/L1 CRUD + FTS5 search + L2/L3 markdown files + checkpoint + recall. ~820 lines.
-- ✅ **RRF** (`src/embedded/rrf.zig`) — Reciprocal Rank Fusion with deep-copy + sort. 5 unit tests covering empty/single/overlapping/disjoint/capped cases.
+- ✅ **SQLite C bindings** (`src/embedded/sqlite.zig`) — manual extern declarations (no `@cImport` in Zig 0.17-dev). Wraps `sqlite3_open_v2`, `exec`, `prepare_v2`, `step`, `bind_*`, `column_*`, `close`, `busy_timeout`, `errmsg`, `changes`, `last_insert_rowid`. ~280 lines. Also re-exported from the package root for maintenance tooling/tests.
+- ✅ **SQLite store** (`src/embedded/sqlite_store.zig`) — L1 CRUD + FTS5 search + recall + delete/restore/purge + in-place schema migration. ~565 lines.
+- ✅ **RRF** (`src/embedded/rrf.zig`) — Reciprocal Rank Fusion with deep-copy + sort. 5 unit tests covering empty/single/overlapping/disjoint/capped cases. (Currently exercised by the hybrid search path only when both FTS and vector legs exist; with embeddings removed it is dormant but tested.)
 - ✅ **Store vtable** (`src/store.zig`) — `MemoryStore` interface with full vtable for future backend swap.
-- ✅ **FTS5 schema** — `l0_fts` + `l1_fts` virtual tables with sync triggers (insert/delete/update).
-- ✅ **Schema auto-creation** — `SqliteStore.init()` creates all tables, indexes, triggers, and detects FTS5 support at runtime.
+- ✅ **FTS5 schema** — `l1_fts` virtual table with sync triggers (insert/delete/content-update).
+- ✅ **Schema auto-creation** — `SqliteStore.init()` creates tables, indexes, triggers, and detects FTS5 support at runtime.
 - ✅ **WAL mode** + busy_timeout + 64MB cache + foreign keys — same PRAGMAs as the TS implementation.
-- ✅ **L0 capture** — `addConversation()` with transaction-wrapped batch inserts.
-- ✅ **L0 query** — `queryConversation()` with isolation filtering + `updated_after` cursor + limit/offset.
-- ✅ **L1 upsert** — delete + insert pattern (for FTS sync), optional embedding blob storage.
-- ✅ **L1 FTS search** — `searchL1Fts()` with BM25 scoring + isolation filtering.
-- ✅ **L1 hybrid search** — `searchL1Hybrid()` (currently FTS-only; vector search deferred to Phase 2).
-- ✅ **L1 deletion (soft + hard)** — `deleteL1(record_id, options, iso)` with `DeleteOptions{ .soft }`. Soft delete marks `deleted = 1` (single-row `UPDATE`, recoverable); hard delete removes the row (the `l1_ad` trigger evicts the FTS entry). Companion APIs: `restoreL1` (undo soft delete), `purgeDeletedL1` (garbage-collect all soft-deleted rows in scope, returns count). All paths honor `IsolationContext` and return `bool` (false = no matching row). `upsertL1` on a soft-deleted `record_id` revives it (`deleted = 0`).
+- ✅ **L1 upsert** — delete + insert pattern (for FTS sync). Upserting a soft-deleted `record_id` revives it.
+- ✅ **L1 FTS search** — `searchL1Fts()` with BM25 scoring + isolation filtering + `deleted = 0` filtering.
+- ✅ **L1 hybrid search** — `searchL1Hybrid()` (FTS-only since embeddings were removed; the RRF fusion point is retained).
+- ✅ **L1 deletion (soft + hard)** — `deleteL1(record_id, options, iso)` with `DeleteOptions{ .soft }`. Soft delete marks `deleted = 1` (single-row `UPDATE`, recoverable); hard delete removes the row (the `l1_ad` trigger evicts the FTS entry). Companion APIs: `restoreL1` (undo soft delete), `purgeDeletedL1` (garbage-collect all soft-deleted rows in scope, returns count). All paths honor `IsolationContext` and return `bool` (false = no matching row).
 - ✅ **Delete-aware search/recall** — `searchL1Fts`, `searchL1Hybrid` and `recall` filter `deleted = 0` rows, so soft-deleted memories never leak into recall.
-- ✅ **Schema migration** — `SqliteStore.init()` adds the `deleted` column (`ALTER TABLE ... ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`) to existing databases, guarded by a `PRAGMA table_info` probe so it runs at most once.
+- ✅ **Schema migration** — `SqliteStore.init()` runs `migrateSchema()`: adds the `deleted` column (`ALTER TABLE ... ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`) to existing databases, guarded by a `PRAGMA table_info` probe so it runs at most once; builds `idx_l1_deleted` after the column is guaranteed to exist; and normalizes the legacy unguarded `l1_au` trigger to `AFTER UPDATE OF content` so soft delete/restore never churn the FTS index (fresh databases already have the guarded form).
 - ✅ **Delete APIs through vtable + MemoryContext** — `MemoryStore.deleteL1`, `restoreL1`, `purgeDeletedL1` and `MemoryContext.delete/deleteHard/restore/purgeDeleted` delegate through the vtable.
-- ✅ **L2/L3 files** — `readCore/writeCore` for persona.md, `readScenario/writeScenario/listScenarios` for scene_blocks/*.md.
-- ✅ **Recall** — `recall()` aggregates L3 + L2 + L1 with `total_chars` budget tracking.
-- ✅ **Checkpoint** — `getCheckpoint/setCheckpoint` in SQLite table (serialize is implemented; parse is a stub for Phase 2).
-- ✅ **Integration tests** (`test/sqlite_store_test.zig`) — 12 end-to-end tests: init/schema, L0 add+query, L0 updated_after filter, L1 upsert+FTS, L1 no-match, L1 upsert replaces, L3 write+read, L3 missing returns null, L2 write+read, L2 list, checkpoint, recall.
-- ✅ **Unit tests** — 12 tests in types.zig + rrf.zig (MemoryType round-trip, IsolationContext whereClause, RRF merge cases).
+- ✅ **Recall** — `recall()` / `recallWithBudget()` aggregate L1 hits with `total_chars` budget tracking (L2/L3 aggregation was removed with those layers).
+- ✅ **Integration tests** (`test/sqlite_store_test.zig`) — 22 end-to-end tests: init/schema, L1 upsert+FTS, no-match, upsert-replaces, recall, vtable/MemoryContext round-trip, FTS-only hybrid, recallWithBudget capping, plus 10 delete/restore/purge/isolation tests and a legacy-DB migration test.
+- ✅ **Unit tests** — 16 tests in types.zig + rrf.zig + context.zig (MemoryType round-trip, IsolationContext whereClause, DeleteOptions defaults, RRF merge cases, MemoryContext delegation).
 
-**Total: 24 tests pass, 0 leaks.**
+**Total: 38 tests pass, 0 leaks.**
+
+_(Historical note: the original Phase 1 inventory — L0 capture/query, L2 scenario files, L3 persona, checkpoint get/set — was removed by the v0.4.x simplification commits `a902004`, `e3a1270`, `c6e22fb`; see Problem 8 below.)_
 
 ### Problems Found & Solutions
 
@@ -1726,15 +1711,16 @@ zig build test-all     # Run all tests
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `src/types.zig` | 345 | Core types + isolation + tests |
-| `src/store.zig` | 175 | MemoryStore vtable interface |
-| `src/root.zig` | 42 | Public API re-exports |
-| `src/embedded/sqlite.zig` | 280 | SQLite C extern bindings |
-| `src/embedded/sqlite_store.zig` | 820 | SQLite store implementation |
-| `src/embedded/rrf.zig` | 250 | Reciprocal Rank Fusion + tests |
-| `test/sqlite_store_test.zig` | 465 | Integration tests (12 tests) |
-| `build.zig` | 80 | Build config + test targets |
-| **Total** | **~2457** | |
+| `src/types.zig` | 316 | Core types + isolation + `DeleteOptions` + tests |
+| `src/store.zig` | 108 | `MemoryStore` vtable interface (incl. delete/restore/purge) |
+| `src/root.zig` | 47 | Public API re-exports (incl. `DeleteOptions`, `sqlite` bindings) |
+| `src/context.zig` | 366 | `MemoryContext` + SqliteStore vtable adapter + tests |
+| `src/embedded/sqlite.zig` | 282 | SQLite C extern bindings |
+| `src/embedded/sqlite_store.zig` | 565 | SQLite store: L1 CRUD + FTS5 + delete/restore/purge + migration |
+| `src/embedded/rrf.zig` | 248 | Reciprocal Rank Fusion + tests |
+| `test/sqlite_store_test.zig` | 1005 | Integration tests (22 tests, incl. 11 delete/migration) |
+| `build.zig` | 122 | Build config + test targets |
+| **Total** | **~3059** | |
 
 ---
 
