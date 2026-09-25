@@ -127,6 +127,22 @@ pub const MemoryContext = struct {
     pub fn purgeDeleted(self: *MemoryContext) !u32 {
         return self.store.purgeDeletedL1(self.iso);
     }
+
+    /// Enumerate live (non-deleted) memories in this isolation scope, returning
+    /// only the metadata projection (`scene_name`, `created_time`,
+    /// `updated_time`, `metadata_json`). The `filter` narrows the result set
+    /// (session/type/time range/limit/offset); pass `.{}` for all live records
+    /// up to the default limit of 100.
+    ///
+    /// Returns an owned `[]MemorySummary` — the caller frees each entry via
+    /// `deinit` and then frees the slice.
+    pub fn list(
+        self: *MemoryContext,
+        allocator: std.mem.Allocator,
+        filter: types.L1QueryFilter,
+    ) ![]types.MemorySummary {
+        return self.store.listL1(allocator, filter, self.iso);
+    }
 };
 
 // ============================
@@ -143,6 +159,7 @@ pub const SqliteStoreVTable = store_mod.MemoryStore.VTable{
     .delete_l1 = vtableDeleteL1,
     .restore_l1 = vtableRestoreL1,
     .purge_deleted_l1 = vtablePurgeDeletedL1,
+    .list_l1 = vtableListL1,
     .recall = vtableRecall,
     .recall_with_budget = vtableRecallWithBudget,
 };
@@ -180,6 +197,11 @@ fn vtableRestoreL1(ctx: *anyopaque, record_id: []const u8, iso: types.IsolationC
 fn vtablePurgeDeletedL1(ctx: *anyopaque, iso: types.IsolationContext) !u32 {
     const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
     return self.purgeDeletedL1(iso);
+}
+
+fn vtableListL1(ctx: *anyopaque, allocator: std.mem.Allocator, filter: types.L1QueryFilter, iso: types.IsolationContext) ![]types.MemorySummary {
+    const self: *sqlite_store.SqliteStore = @ptrCast(@alignCast(ctx));
+    return self.listL1(allocator, filter, iso);
 }
 
 fn vtableRecall(ctx: *anyopaque, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
@@ -363,4 +385,53 @@ test "MemoryContext recall returns empty on fresh store" {
     // Fresh store → no L1 hits.
     try std.testing.expectEqual(@as(usize, 0), result.l1_results.len);
     try std.testing.expectEqual(@as(usize, 0), result.total_chars);
+}
+
+test "MemoryContext list returns only metadata projection" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const tmp_dir = "/tmp/agent-memory-ctx-list-test";
+    std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
+
+    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/memory.db", .{tmp_dir}, 0);
+    defer allocator.free(db_path);
+
+    var store = try sqlite_store.SqliteStore.init(allocator, io, db_path);
+    defer store.deinit();
+
+    var mem_ctx = MemoryContext{
+        .store = .{ .ctx = @ptrCast(&store), .vtable = &SqliteStoreVTable },
+        .iso = .{},
+    };
+
+    // Fresh store → empty list.
+    {
+        const items = try mem_ctx.list(allocator, .{});
+        defer allocator.free(items);
+        try std.testing.expectEqual(@as(usize, 0), items.len);
+    }
+
+    // Save two memories with distinct scene names.
+    _ = try mem_ctx.save(allocator, "User prefers dark mode", .persona, 70, "ui prefs");
+    _ = try mem_ctx.save(allocator, "Project uses Zig 0.17", .episodic, 65, "toolchain");
+
+    const items = try mem_ctx.list(allocator, .{});
+    defer {
+        for (items) |it| it.deinit(allocator);
+        allocator.free(items);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+
+    // Only the four metadata fields are projected; verify they are populated
+    // and that no content leaks into the summary.
+    for (items) |it| {
+        try std.testing.expect(it.created_time.len > 0);
+        try std.testing.expect(it.updated_time.len > 0);
+        try std.testing.expect(it.metadata_json.len > 0);
+    }
 }

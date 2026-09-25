@@ -48,6 +48,14 @@ pub const MemoryStore = struct {
             iso: types.IsolationContext,
         ) anyerror!u32,
 
+        // L1 — list
+        list_l1: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            filter: types.L1QueryFilter,
+            iso: types.IsolationContext,
+        ) anyerror![]types.MemorySummary,
+
         // Recall
         recall: *const fn (
             ctx: *anyopaque,
@@ -96,6 +104,27 @@ pub const MemoryStore = struct {
     /// Physically remove all soft-deleted records in scope. Returns the purge count.
     pub fn purgeDeletedL1(self: MemoryStore, iso: types.IsolationContext) !u32 {
         return self.vtable.purge_deleted_l1(self.ctx, iso);
+    }
+
+    /// Enumerate live (non-deleted) L1 memories in scope, returning only the
+    /// metadata projection (`scene_name`, `created_time`, `updated_time`,
+    /// `metadata_json`). The `filter` narrows the result set (session/type/
+    /// time range/limit/offset); pass `.{}` for all live records up to the
+    /// default limit of 100.
+    ///
+    /// Returns an owned `[]MemorySummary` — the caller MUST free each entry
+    /// via `deinit` and then free the slice:
+    ///   ```zig
+    ///   const items = try store.listL1(allocator, .{}, iso);
+    ///   defer { for (items) |it| it.deinit(allocator); allocator.free(items); }
+    ///   ```
+    pub fn listL1(
+        self: MemoryStore,
+        allocator: std.mem.Allocator,
+        filter: types.L1QueryFilter,
+        iso: types.IsolationContext,
+    ) ![]types.MemorySummary {
+        return self.vtable.list_l1(self.ctx, allocator, filter, iso);
     }
 
     pub fn recall(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {

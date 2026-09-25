@@ -26,6 +26,7 @@ pub const SearchResult = types.SearchResult;
 pub const StoreCapabilities = types.StoreCapabilities;
 pub const RecallResult = types.RecallResult;
 pub const L1QueryFilter = types.L1QueryFilter;
+pub const MemorySummary = types.MemorySummary;
 pub const Checkpoint = types.Checkpoint;
 pub const ExtractionResult = types.ExtractionResult;
 pub const DedupAction = types.DedupAction;

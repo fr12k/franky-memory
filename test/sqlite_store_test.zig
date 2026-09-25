@@ -1032,3 +1032,313 @@ test "MemoryContext delete/restore/purge delegate through vtable" {
     // Purge via MemoryContext (nothing soft-deleted → 0).
     try std.testing.expectEqual(@as(u32, 0), try mem_ctx.purgeDeleted());
 }
+
+// ============================
+// listL1 — metadata projection
+// ============================
+
+test "listL1 returns empty on fresh store" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    const items = try ctx.store.listL1(ctx.allocator, .{}, iso);
+    defer ctx.allocator.free(items);
+    try std.testing.expectEqual(@as(usize, 0), items.len);
+}
+
+test "listL1 returns only metadata fields for live records" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{ .session_id = "s1" };
+    const r1 = types.L1Record{
+        .record_id = "mem-list-1",
+        .content = "User decided to use PostgreSQL for their database",
+        .type = .episodic,
+        .priority = 75,
+        .scene_name = "database setup",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "2025-01-15T10:05:00Z",
+        .updated_time = "2025-01-15T10:05:00Z",
+        .metadata_json = "{\"source\":\"chat\"}",
+    };
+    _ = try ctx.store.upsertL1(r1, iso);
+
+    const r2 = types.L1Record{
+        .record_id = "mem-list-2",
+        .content = "User prefers tabs over spaces",
+        .type = .persona,
+        .priority = 70,
+        .scene_name = "editor prefs",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "2025-02-01T09:00:00Z",
+        .updated_time = "2025-02-01T09:00:00Z",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r2, iso);
+
+    const items = try ctx.store.listL1(ctx.allocator, .{}, iso);
+    defer {
+        for (items) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(items);
+    }
+
+    // Two live records.
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+
+    // Newest first (created_time DESC).
+    try std.testing.expectEqualStrings("editor prefs", items[0].scene_name);
+    try std.testing.expectEqualStrings("2025-02-01T09:00:00Z", items[0].created_time);
+    try std.testing.expectEqualStrings("2025-02-01T09:00:00Z", items[0].updated_time);
+    try std.testing.expectEqualStrings("{}", items[0].metadata_json);
+
+    try std.testing.expectEqualStrings("database setup", items[1].scene_name);
+    try std.testing.expectEqualStrings("2025-01-15T10:05:00Z", items[1].created_time);
+    try std.testing.expectEqualStrings("2025-01-15T10:05:00Z", items[1].updated_time);
+    try std.testing.expectEqualStrings("{\"source\":\"chat\"}", items[1].metadata_json);
+}
+
+test "listL1 excludes soft-deleted records" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{ .session_id = "s1" };
+    _ = try ctx.store.upsertL1(makeRecord("mem-list-live", "User likes Python"), iso);
+    _ = try ctx.store.upsertL1(makeRecord("mem-list-dead", "User likes Java"), iso);
+
+    // Soft-delete one.
+    _ = try ctx.store.deleteL1("mem-list-dead", .{}, iso);
+
+    const items = try ctx.store.listL1(ctx.allocator, .{}, iso);
+    defer {
+        for (items) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(items);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("test", items[0].scene_name);
+}
+
+test "listL1 respects isolation context" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    // Two records in different user scopes. upsertL1 uses the record's own
+    // isolation fields (the iso arg is ignored for writes), so set them on
+    // the record directly.
+    var r_a = makeRecord("mem-iso-a", "User A fact");
+    r_a.user_id = "userA";
+    var r_b = makeRecord("mem-iso-b", "User B fact");
+    r_b.user_id = "userB";
+    _ = try ctx.store.upsertL1(r_a, .{ .user_id = "userA" });
+    _ = try ctx.store.upsertL1(r_b, .{ .user_id = "userB" });
+
+    // Query userA scope → only its record.
+    const items_a = try ctx.store.listL1(ctx.allocator, .{}, .{ .user_id = "userA" });
+    defer {
+        for (items_a) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(items_a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), items_a.len);
+
+    // Query userB scope → only its record.
+    const items_b = try ctx.store.listL1(ctx.allocator, .{}, .{ .user_id = "userB" });
+    defer {
+        for (items_b) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(items_b);
+    }
+    try std.testing.expectEqual(@as(usize, 1), items_b.len);
+}
+
+test "listL1 filters by session_id and type" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    // upsertL1 uses the record's own session_id (the iso arg is ignored for
+    // writes), so set it on each record directly.
+    var r1 = makeRecord("mem-filt-1", "fact one");
+    r1.session_id = "sessA";
+    var r2 = makeRecord("mem-filt-2", "fact two");
+    r2.session_id = "sessB";
+    _ = try ctx.store.upsertL1(r1, .{ .session_id = "sessA" });
+    _ = try ctx.store.upsertL1(r2, .{ .session_id = "sessB" });
+
+    // makeRecord uses type=.episodic; insert a persona record in sessA.
+    const r3 = types.L1Record{
+        .record_id = "mem-filt-3",
+        .content = "persona fact",
+        .type = .persona,
+        .priority = 50,
+        .scene_name = "scene",
+        .session_key = "sk",
+        .session_id = "sessA",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "",
+        .updated_time = "",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r3, .{ .session_id = "sessA" });
+
+    // Filter by session_id.
+    const sess_a = try ctx.store.listL1(ctx.allocator, .{ .session_id = "sessA" }, .{});
+    defer {
+        for (sess_a) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(sess_a);
+    }
+    try std.testing.expectEqual(@as(usize, 2), sess_a.len);
+
+    // Filter by session_id AND type.
+    const sess_a_persona = try ctx.store.listL1(
+        ctx.allocator,
+        .{ .session_id = "sessA", .type = .persona },
+        .{},
+    );
+    defer {
+        for (sess_a_persona) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(sess_a_persona);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sess_a_persona.len);
+}
+
+test "listL1 applies limit and offset" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    // Insert 3 records with distinct created_times so ordering is stable.
+    var i: u8 = 0;
+    while (i < 3) : (i += 1) {
+        var rec = makeRecord(
+            try std.fmt.allocPrint(ctx.allocator, "mem-page-{d}", .{i}),
+            "content",
+        );
+        defer ctx.allocator.free(rec.record_id);
+        rec.created_time = try std.fmt.allocPrint(ctx.allocator, "2025-01-0{d}T00:00:00Z", .{i + 1});
+        defer ctx.allocator.free(rec.created_time);
+        _ = try ctx.store.upsertL1(rec, iso);
+    }
+
+    // limit=2 → newest 2.
+    const page1 = try ctx.store.listL1(ctx.allocator, .{ .limit = 2 }, iso);
+    defer {
+        for (page1) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(page1);
+    }
+    try std.testing.expectEqual(@as(usize, 2), page1.len);
+    try std.testing.expectEqualStrings("2025-01-03T00:00:00Z", page1[0].created_time);
+    try std.testing.expectEqualStrings("2025-01-02T00:00:00Z", page1[1].created_time);
+
+    // limit=2, offset=2 → oldest 1.
+    const page2 = try ctx.store.listL1(ctx.allocator, .{ .limit = 2, .offset = 2 }, iso);
+    defer {
+        for (page2) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(page2);
+    }
+    try std.testing.expectEqual(@as(usize, 1), page2.len);
+    try std.testing.expectEqualStrings("2025-01-01T00:00:00Z", page2[0].created_time);
+}
+
+test "listL1 filters by time range" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    const r1 = blk: {
+        var r = makeRecord("mem-tr-1", "old");
+        r.created_time = "2025-01-01T00:00:00Z";
+        break :blk r;
+    };
+    const r2 = blk: {
+        var r = makeRecord("mem-tr-2", "mid");
+        r.created_time = "2025-02-01T00:00:00Z";
+        break :blk r;
+    };
+    const r3 = blk: {
+        var r = makeRecord("mem-tr-3", "new");
+        r.created_time = "2025-03-01T00:00:00Z";
+        break :blk r;
+    };
+    _ = try ctx.store.upsertL1(r1, iso);
+    _ = try ctx.store.upsertL1(r2, iso);
+    _ = try ctx.store.upsertL1(r3, iso);
+
+    // time_start >= 2025-02 → excludes the January record.
+    const after_feb = try ctx.store.listL1(ctx.allocator, .{ .time_start = "2025-02-01T00:00:00Z" }, iso);
+    defer {
+        for (after_feb) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(after_feb);
+    }
+    try std.testing.expectEqual(@as(usize, 2), after_feb.len);
+
+    // time_end <= 2025-02 → excludes the March record.
+    const before_mar = try ctx.store.listL1(ctx.allocator, .{ .time_end = "2025-02-28T23:59:59Z" }, iso);
+    defer {
+        for (before_mar) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(before_mar);
+    }
+    try std.testing.expectEqual(@as(usize, 2), before_mar.len);
+
+    // Both bounds → only February.
+    const feb_only = try ctx.store.listL1(
+        ctx.allocator,
+        .{ .time_start = "2025-02-01T00:00:00Z", .time_end = "2025-02-28T23:59:59Z" },
+        iso,
+    );
+    defer {
+        for (feb_only) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(feb_only);
+    }
+    try std.testing.expectEqual(@as(usize, 1), feb_only.len);
+    try std.testing.expectEqualStrings("2025-02-01T00:00:00Z", feb_only[0].created_time);
+}
+
+test "MemoryContext list delegates through vtable" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    var mem_ctx = agent_memory.MemoryContext{
+        .store = ctx.store.toMemoryStore(),
+        .iso = .{ .session_id = "s1" },
+    };
+
+    _ = try mem_ctx.save(ctx.allocator, "User prefers PostgreSQL over MySQL", .persona, 80, "database preferences");
+
+    const items = try mem_ctx.list(ctx.allocator, .{});
+    defer {
+        for (items) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(items);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("database preferences", items[0].scene_name);
+    // created_time / updated_time are populated by save() with a ms-epoch string.
+    try std.testing.expect(items[0].created_time.len > 0);
+    try std.testing.expect(items[0].updated_time.len > 0);
+    try std.testing.expectEqualStrings("{}", items[0].metadata_json);
+}
