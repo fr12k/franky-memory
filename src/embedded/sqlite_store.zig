@@ -221,6 +221,115 @@ pub const SqliteStore = struct {
         return @intCast(self.db.changes());
     }
 
+    /// Enumerate live (non-deleted) L1 memories in scope, returning only the
+    /// metadata projection (`scene_name`, `created_time`, `updated_time`,
+    /// `metadata_json`). The `filter` narrows the result set: `session_id`,
+    /// `type`, `time_start`/`time_end` (compared against `created_time`,
+    /// lexicographically — both bounds optional), and `limit`/`offset`.
+    ///
+    /// Returns an owned `[]MemorySummary` — the caller frees each entry's
+    /// strings via `deinit` and then frees the slice.
+    ///
+    /// Ordering is `created_time DESC` (newest first), with `record_id` as a
+    /// deterministic tie-breaker. This is a full scan filtered by the
+    /// isolation scope — appropriate for enumerating a single tenant's
+    /// memories, not for paginating millions of rows.
+    pub fn listL1(
+        self: *SqliteStore,
+        allocator: std.mem.Allocator,
+        filter: types.L1QueryFilter,
+        iso: types.IsolationContext,
+    ) ![]types.MemorySummary {
+        // Build the WHERE clause. The isolation fragment is always present;
+        // the filter fragments are appended conditionally. Bind parameters
+        // are accumulated in order so the caller can bind them in sequence.
+        var where: std.ArrayList(u8) = .empty;
+        defer where.deinit(allocator);
+
+        try where.appendSlice(allocator, "deleted = 0 AND team_id = ? AND agent_id = ? AND user_id = ?");
+        var param_idx: c_int = 4; // 3 isolation params come first
+
+        if (filter.session_id) |sid| {
+            _ = sid;
+            try where.appendSlice(allocator, " AND session_id = ?");
+            param_idx += 1;
+        }
+        if (filter.type) |t| {
+            _ = t;
+            try where.appendSlice(allocator, " AND type = ?");
+            param_idx += 1;
+        }
+        if (filter.time_start) |ts| {
+            _ = ts;
+            try where.appendSlice(allocator, " AND created_time >= ?");
+            param_idx += 1;
+        }
+        if (filter.time_end) |te| {
+            _ = te;
+            try where.appendSlice(allocator, " AND created_time <= ?");
+            param_idx += 1;
+        }
+
+        const sql = try std.fmt.allocPrint(
+            allocator,
+            "SELECT scene_name, created_time, updated_time, metadata_json " ++
+                "FROM l1_records WHERE {s} " ++
+                "ORDER BY created_time DESC, record_id DESC LIMIT ? OFFSET ?",
+            .{where.items},
+        );
+        defer allocator.free(sql);
+
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+
+        // Bind parameters in the order they appear in the WHERE clause.
+        var bind_idx: c_int = 1;
+        try stmt.bindText(bind_idx, iso.team_id);
+        bind_idx += 1;
+        try stmt.bindText(bind_idx, iso.agent_id);
+        bind_idx += 1;
+        try stmt.bindText(bind_idx, iso.user_id);
+        bind_idx += 1;
+        if (filter.session_id) |sid| {
+            try stmt.bindText(bind_idx, sid);
+            bind_idx += 1;
+        }
+        if (filter.type) |t| {
+            try stmt.bindText(bind_idx, t.toString());
+            bind_idx += 1;
+        }
+        if (filter.time_start) |ts| {
+            try stmt.bindText(bind_idx, ts);
+            bind_idx += 1;
+        }
+        if (filter.time_end) |te| {
+            try stmt.bindText(bind_idx, te);
+            bind_idx += 1;
+        }
+        // LIMIT / OFFSET
+        try stmt.bindInt(bind_idx, @intCast(filter.limit));
+        bind_idx += 1;
+        try stmt.bindInt(bind_idx, @intCast(filter.offset));
+
+        var results: std.ArrayList(types.MemorySummary) = .empty;
+        errdefer {
+            for (results.items) |r| r.deinit(allocator);
+            results.deinit(allocator);
+        }
+
+        while (try stmt.step()) {
+            const summary = types.MemorySummary{
+                .scene_name = try allocator.dupe(u8, stmt.columnText(0)),
+                .created_time = try allocator.dupe(u8, stmt.columnText(1)),
+                .updated_time = try allocator.dupe(u8, stmt.columnText(2)),
+                .metadata_json = try allocator.dupe(u8, stmt.columnText(3)),
+            };
+            try results.append(allocator, summary);
+        }
+
+        return try results.toOwnedSlice(allocator);
+    }
+
     /// FTS5 keyword search on L1 records.
     pub fn searchL1Fts(
         self: *SqliteStore,

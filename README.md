@@ -72,6 +72,11 @@ defer recall.deinit(allocator);
 
 // L1 — delete a memory (soft by default, see "Memory deletion" below)
 const deleted = try store.deleteL1("mem-1", .{}, .{});
+
+// L1 — list existing memories (metadata projection only:
+// scene_name, created_time, updated_time, metadata_json)
+const items = try store.listL1(allocator, .{}, .{});
+defer { for (items) |it| it.deinit(allocator); allocator.free(items); }
 ```
 
 ## Memory deletion
@@ -125,6 +130,47 @@ const purged = try store.purgeDeletedL1(iso);
 - `upsertL1` on a soft-deleted `record_id` re-creates the row with
   `deleted = 0` — an upsert revives a soft-deleted memory.
 
+## Memory listing
+
+`listL1` enumerates the **live** (non-deleted) memories in an isolation scope
+and returns only the metadata projection — `scene_name`, `created_time`,
+`updated_time`, `metadata_json` — without pulling the full `content`. This is
+the lightweight counterpart to `searchL1Fts`/`recall` for UIs and tooling that
+need to browse existing memories rather than rank them by relevance.
+
+```zig
+// Directly on SqliteStore:
+const items = try store.listL1(allocator, .{}, .{});
+defer { for (items) |it| it.deinit(allocator); allocator.free(items); }
+for (items) |it| {
+    std.debug.print("{s} | {s} | {s} | {s}\n",
+        .{ it.scene_name, it.created_time, it.updated_time, it.metadata_json });
+}
+```
+
+The optional `L1QueryFilter` narrows the result set:
+
+```zig
+const recent = try store.listL1(allocator, .{
+    .session_id = "s1",          // only this session
+    .type = .persona,             // only persona memories
+    .time_start = "2025-01-01T00:00:00Z",  // created on/after
+    .time_end   = "2025-12-31T23:59:59Z",  // created on/before
+    .limit = 50,
+    .offset = 0,
+}, .{});
+defer { for (recent) |it| it.deinit(allocator); allocator.free(recent); }
+```
+
+- Results are ordered `created_time DESC, record_id DESC` (newest first,
+  deterministic tie-break).
+- `time_start`/`time_end` are compared against `created_time`, lexicographically
+  (suitable for ISO 8601 / millisecond-epoch strings).
+- Soft-deleted records are excluded; the isolation context (`team_id`,
+  `agent_id`, `user_id`) is always applied.
+- `MemorySummary` owns its string fields — free each entry via `deinit` and
+  then free the slice.
+
 ### Through the `MemoryStore` vtable / `MemoryContext`
 
 ```zig
@@ -141,6 +187,10 @@ _ = try mem_ctx.restore("mem-1");
 
 // Purge all soft-deleted records in this isolation scope
 _ = try mem_ctx.purgeDeleted();
+
+// List existing memories (metadata projection only)
+const items = try mem_ctx.list(allocator, .{});
+defer { for (items) |it| it.deinit(allocator); allocator.free(items); }
 ```
 
 ## Build

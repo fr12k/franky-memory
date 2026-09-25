@@ -183,6 +183,31 @@ pub const RecallResult = struct {
 };
 
 // ============================
+// Memory Summary (list projection)
+// ============================
+
+/// A lightweight projection of an L1 memory record — exactly the metadata
+/// fields needed to enumerate existing memories without pulling their full
+/// content.
+///
+/// Returned by `MemoryStore.listL1` / `MemoryContext.list`. Each string
+/// field is owned by the caller and must be freed via `deinit` (or by
+/// freeing each entry and the owning slice — see `listL1` doc comment).
+pub const MemorySummary = struct {
+    scene_name: []const u8,
+    created_time: []const u8,
+    updated_time: []const u8,
+    metadata_json: []const u8,
+
+    pub fn deinit(self: MemorySummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.scene_name);
+        allocator.free(self.created_time);
+        allocator.free(self.updated_time);
+        allocator.free(self.metadata_json);
+    }
+};
+
+// ============================
 // Query Filters
 // ============================
 
