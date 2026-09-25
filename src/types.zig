@@ -212,6 +212,9 @@ pub const MemorySummary = struct {
 // ============================
 
 /// Filter for querying L1 records.
+///
+/// `limit = 0` means **all** matching records (no SQL LIMIT); the default
+/// is 100.
 pub const L1QueryFilter = struct {
     session_id: ?[]const u8 = null,
     type: ?MemoryType = null,
