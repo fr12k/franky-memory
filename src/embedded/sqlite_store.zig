@@ -227,6 +227,9 @@ pub const SqliteStore = struct {
     /// `type`, `time_start`/`time_end` (compared against `created_time`,
     /// lexicographically — both bounds optional), and `limit`/`offset`.
     ///
+    /// `filter.limit = 0` means **all** matching records (the SQL LIMIT
+    /// clause is omitted); the default `L1QueryFilter.limit` is 100.
+    ///
     /// Returns an owned `[]MemorySummary` — the caller frees each entry's
     /// strings via `deinit` and then frees the slice.
     ///
@@ -270,13 +273,17 @@ pub const SqliteStore = struct {
             param_idx += 1;
         }
 
-        const sql = try std.fmt.allocPrint(
-            allocator,
-            "SELECT scene_name, created_time, updated_time, metadata_json " ++
-                "FROM l1_records WHERE {s} " ++
-                "ORDER BY created_time DESC, record_id DESC LIMIT ? OFFSET ?",
-            .{where.items},
-        );
+        // Build the SQL. limit=0 means "all" → omit the LIMIT clause
+        // entirely (SQLite LIMIT 0 returns zero rows, not all).
+        var sql_buf: std.ArrayList(u8) = .empty;
+        defer sql_buf.deinit(allocator);
+        try sql_buf.appendSlice(allocator, "SELECT scene_name, created_time, updated_time, metadata_json FROM l1_records WHERE ");
+        try sql_buf.appendSlice(allocator, where.items);
+        try sql_buf.appendSlice(allocator, " ORDER BY created_time DESC, record_id DESC");
+        if (filter.limit != 0) {
+            try sql_buf.appendSlice(allocator, " LIMIT ? OFFSET ?");
+        }
+        const sql = try sql_buf.toOwnedSlice(allocator);
         defer allocator.free(sql);
 
         var stmt = try self.db.prepare(sql);
@@ -306,10 +313,13 @@ pub const SqliteStore = struct {
             try stmt.bindText(bind_idx, te);
             bind_idx += 1;
         }
-        // LIMIT / OFFSET
-        try stmt.bindInt(bind_idx, @intCast(filter.limit));
-        bind_idx += 1;
-        try stmt.bindInt(bind_idx, @intCast(filter.offset));
+        // LIMIT / OFFSET — only bound when limit != 0 (limit = 0 means
+        // "all", so the LIMIT clause is omitted from the SQL entirely).
+        if (filter.limit != 0) {
+            try stmt.bindInt(bind_idx, @intCast(filter.limit));
+            bind_idx += 1;
+            try stmt.bindInt(bind_idx, @intCast(filter.offset));
+        }
 
         var results: std.ArrayList(types.MemorySummary) = .empty;
         errdefer {

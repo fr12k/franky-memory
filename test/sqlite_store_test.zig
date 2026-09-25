@@ -1264,6 +1264,49 @@ test "listL1 applies limit and offset" {
     try std.testing.expectEqualStrings("2025-01-01T00:00:00Z", page2[0].created_time);
 }
 
+test "listL1 with limit=0 returns all matching records" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    const iso = types.IsolationContext{};
+    // Insert 5 records.
+    var i: u8 = 0;
+    while (i < 5) : (i += 1) {
+        var rec = makeRecord(
+            try std.fmt.allocPrint(ctx.allocator, "mem-all-{d}", .{i}),
+            "content",
+        );
+        defer ctx.allocator.free(rec.record_id);
+        rec.created_time = try std.fmt.allocPrint(ctx.allocator, "2025-01-0{d}T00:00:00Z", .{i + 1});
+        defer ctx.allocator.free(rec.created_time);
+        _ = try ctx.store.upsertL1(rec, iso);
+    }
+
+    // limit=0 → all 5 (no SQL LIMIT clause).
+    const all = try ctx.store.listL1(ctx.allocator, .{ .limit = 0 }, iso);
+    defer {
+        for (all) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(all);
+    }
+    try std.testing.expectEqual(@as(usize, 5), all.len);
+    // Newest first.
+    try std.testing.expectEqualStrings("2025-01-05T00:00:00Z", all[0].created_time);
+    try std.testing.expectEqualStrings("2025-01-01T00:00:00Z", all[4].created_time);
+
+    // limit=0 with a type filter still returns all matching that filter.
+    // makeRecord uses type=.episodic, so all 5 match.
+    const all_episodic = try ctx.store.listL1(
+        ctx.allocator,
+        .{ .limit = 0, .type = .episodic },
+        iso,
+    );
+    defer {
+        for (all_episodic) |it| it.deinit(ctx.allocator);
+        ctx.allocator.free(all_episodic);
+    }
+    try std.testing.expectEqual(@as(usize, 5), all_episodic.len);
+}
+
 test "listL1 filters by time range" {
     var ctx = try TestCtx.init();
     defer ctx.deinit();
