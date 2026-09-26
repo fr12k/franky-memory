@@ -350,6 +350,14 @@ pub const SqliteStore = struct {
     ) ![]types.SearchResult {
         if (!self.capabilities.fts_search) return &.{};
 
+        // Empty / whitespace-only query: return all live rows in scope (newest
+        // first), up to top_k. FTS5 MATCH with an empty phrase does not match
+        // everything — it matches nothing — so we short-circuit here and query
+        // l1_records directly. This is the "what do I already know?" path.
+        if (isBlankQuery(query)) {
+            return self.searchL1All(allocator, top_k, iso);
+        }
+
         const fts_query = try buildFtsQuery(allocator, query);
         defer allocator.free(fts_query);
 
@@ -396,7 +404,56 @@ pub const SqliteStore = struct {
         return try results.toOwnedSlice(allocator);
     }
 
-    /// Hybrid search: FTS + optional vector, merged with RRF.
+    /// Return all live L1 records in scope (newest first), up to `top_k`.
+    /// Used as the fallback for empty / whitespace-only queries — FTS5 MATCH
+    /// with an empty phrase matches nothing, so we bypass FTS and query
+    /// l1_records directly. Score is set to 0 (no relevance ranking).
+    fn searchL1All(
+        self: *SqliteStore,
+        allocator: std.mem.Allocator,
+        top_k: u32,
+        iso: types.IsolationContext,
+    ) ![]types.SearchResult {
+        const sql =
+            "SELECT record_id, content, type, priority, scene_name, " ++
+            "0.0 AS score, session_id, team_id, user_id, agent_id " ++
+            "FROM l1_records " ++
+            "WHERE team_id = ? AND agent_id = ? AND user_id = ? AND deleted = 0 " ++
+            "ORDER BY created_time DESC, record_id DESC LIMIT ?";
+
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+
+        try stmt.bindText(1, iso.team_id);
+        try stmt.bindText(2, iso.agent_id);
+        try stmt.bindText(3, iso.user_id);
+        try stmt.bindInt(4, @intCast(top_k));
+
+        var results: std.ArrayList(types.SearchResult) = .empty;
+        defer results.deinit(allocator);
+        errdefer {
+            for (results.items) |r| r.deinit(allocator);
+        }
+
+        while (try stmt.step()) {
+            const mem_type = types.MemoryType.fromString(stmt.columnText(2)) orelse .episodic;
+            const result = types.SearchResult{
+                .record_id = try allocator.dupe(u8, stmt.columnText(0)),
+                .content = try allocator.dupe(u8, stmt.columnText(1)),
+                .type = mem_type,
+                .priority = @floatCast(stmt.columnFloat(3)),
+                .scene_name = try allocator.dupe(u8, stmt.columnText(4)),
+                .score = @floatCast(stmt.columnFloat(5)),
+                .session_id = try allocator.dupe(u8, stmt.columnText(6)),
+                .team_id = try allocator.dupe(u8, stmt.columnText(7)),
+                .user_id = try allocator.dupe(u8, stmt.columnText(8)),
+                .agent_id = try allocator.dupe(u8, stmt.columnText(9)),
+            };
+            try results.append(allocator, result);
+        }
+
+        return try results.toOwnedSlice(allocator);
+    }
     /// When `query_embedding` is provided, FTS and vector results are
     /// fused via Reciprocal Rank Fusion. Otherwise, FTS-only.
     pub fn searchL1Hybrid(
@@ -521,28 +578,39 @@ pub const SqliteStore = struct {
         // in migrateSchema runs.
 
         // FTS5 tables + triggers (only if FTS5 is available).
+        //
+        // The FTS5 index covers BOTH `content` (the memory body) AND
+        // `scene_name` (the scenario label). Indexing scene_name is essential
+        // — without it, searching for a term that appears only in the scene
+        // name (e.g. "htmx" when the scene is "franky htmx implementation")
+        // returns zero results even though the memory exists. See the
+        // false-negative bug report for the full catalogue of failures this
+        // caused.
         if (fts_available) {
             try db.exec(
                 \\CREATE VIRTUAL TABLE IF NOT EXISTS l1_fts USING fts5(
-                \\  content,
+                \\  content, scene_name,
                 \\  content='l1_records',
                 \\  content_rowid='rowid'
                 \\)
             );
 
-            // Triggers to keep FTS in sync.
+            // Triggers to keep FTS in sync. Both content and scene_name are
+            // mirrored into the FTS index on insert/delete.
             try db.exec(
                 \\CREATE TRIGGER IF NOT EXISTS l1_ai AFTER INSERT ON l1_records BEGIN
-                \\  INSERT INTO l1_fts(rowid, content) VALUES (new.rowid, new.content);
+                \\  INSERT INTO l1_fts(rowid, content, scene_name)
+                \\  VALUES (new.rowid, new.content, new.scene_name);
                 \\END
             );
             try db.exec(
                 \\CREATE TRIGGER IF NOT EXISTS l1_ad AFTER DELETE ON l1_records BEGIN
-                \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+                \\  INSERT INTO l1_fts(l1_fts, rowid, content, scene_name)
+                \\  VALUES('delete', old.rowid, old.content, old.scene_name);
                 \\END
             );
-            // NOTE: `l1_au` (AFTER UPDATE OF content) is created in
-            // migrateSchema — the single creation site. Older databases
+            // NOTE: `l1_au` (AFTER UPDATE OF content, scene_name) is created
+            // in migrateSchema — the single creation site. Older databases
             // may carry an unguarded variant, so it is always normalized
             // there rather than IF NOT EXISTS'd here.
         }
@@ -560,21 +628,50 @@ pub const SqliteStore = struct {
         // either case (CREATE TABLE for fresh, ALTER TABLE just above for old).
         try db.exec("CREATE INDEX IF NOT EXISTS idx_l1_deleted ON l1_records(deleted)");
 
-        // Normalize the FTS update trigger to the content-guarded version.
-        // This is the single creation site for `l1_au`. Databases created
-        // before the soft-delete feature carry an unguarded `l1_au` (AFTER
-        // UPDATE ON ...); CREATE TRIGGER IF NOT EXISTS would leave it in place,
-        // causing needless FTS evict/re-insert churn on every soft
-        // delete/restore. Drop and recreate unconditionally — idempotent for
-        // databases that already have the guarded form.
+        // Normalize the FTS update trigger. This is the single creation
+        // site for `l1_au`. Databases created before the soft-delete feature
+        // carry an unguarded `l1_au` (AFTER UPDATE ON ...); CREATE TRIGGER IF
+        // NOT EXISTS would leave it in place, causing needless FTS
+        // evict/re-insert churn on every soft delete/restore. Drop and
+        // recreate unconditionally — idempotent for databases that already
+        // have the guarded form.
+        //
+        // The trigger fires on updates to EITHER content OR scene_name, since
+        // both are indexed by the FTS table. A single UPDATE OF (content,
+        // scene_name) clause covers both columns.
         if (fts_available) {
+            // Migrate the FTS schema and normalize all triggers atomically.
+            //
+            // migrateFtsSchema detects legacy content-only FTS schemas and
+            // rebuilds the index with both content + scene_name columns. It
+            // also drops and recreates l1_ai and l1_ad. The l1_au trigger is
+            // dropped/recreated here (not inside migrateFtsSchema) so that the
+            // entire operation — FTS rebuild + all three triggers — is within
+            // a single transaction. If any step fails, the database rolls back
+            // to its pre-migration state.
+            //
+            // l1_au normalization: databases created before the soft-delete
+            // feature carry an unguarded `l1_au` (AFTER UPDATE ON ...); CREATE
+            // TRIGGER IF NOT EXISTS would leave it in place, causing needless
+            // FTS evict/re-insert churn on every soft delete/restore. Drop and
+            // recreate unconditionally — idempotent for databases that already
+            // have the guarded form.
+            //
+            // The trigger fires on updates to EITHER content OR scene_name,
+            // since both are indexed by the FTS table.
+            try db.exec("BEGIN IMMEDIATE");
+            errdefer db.exec("ROLLBACK") catch {};
+            try migrateFtsSchema(db);
             try db.exec("DROP TRIGGER IF EXISTS l1_au");
             try db.exec(
-                \\CREATE TRIGGER l1_au AFTER UPDATE OF content ON l1_records BEGIN
-                \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-                \\  INSERT INTO l1_fts(rowid, content) VALUES (new.rowid, new.content);
+                \\CREATE TRIGGER l1_au AFTER UPDATE OF content, scene_name ON l1_records BEGIN
+                \\  INSERT INTO l1_fts(l1_fts, rowid, content, scene_name)
+                \\  VALUES('delete', old.rowid, old.content, old.scene_name);
+                \\  INSERT INTO l1_fts(rowid, content, scene_name)
+                \\  VALUES (new.rowid, new.content, new.scene_name);
                 \\END
             );
+            try db.exec("COMMIT");
         }
     }
 
@@ -584,6 +681,75 @@ pub const SqliteStore = struct {
         defer stmt.finalize();
         while (try stmt.step()) {
             if (std.mem.eql(u8, stmt.columnText(1), "deleted")) return true;
+        }
+        return false;
+    }
+
+    /// Migrate a legacy FTS5 schema to the current one (content + scene_name).
+    ///
+    /// Older databases have an `l1_fts` table with only a `content` column.
+    /// This detects that by probing `pragma_table_info('l1_fts')` for a
+    /// `scene_name` column. When the column is missing, the FTS index is
+    /// dropped and rebuilt from `l1_records` with both columns.
+    ///
+    /// Idempotent: when the schema is already current, this is a no-op (the
+    /// probe finds `scene_name` and returns early).
+    fn migrateFtsSchema(db: *sqlite.Db) !void {
+        if (try ftsHasSceneNameColumn(db)) return;
+
+        // Drop the old FTS index and its triggers, then recreate with both
+        // columns and backfill from l1_records.
+        try db.exec("DROP TRIGGER IF EXISTS l1_ai");
+        try db.exec("DROP TRIGGER IF EXISTS l1_ad");
+        try db.exec("DROP TRIGGER IF EXISTS l1_au");
+        try db.exec("DROP TABLE IF EXISTS l1_fts");
+
+        try db.exec(
+            \\CREATE VIRTUAL TABLE l1_fts USING fts5(
+            \\  content, scene_name,
+            \\  content='l1_records',
+            \\  content_rowid='rowid'
+            \\)
+        );
+
+        // Backfill: insert every live + soft-deleted row into the new FTS
+        // index. Soft-deleted rows are included so that a subsequent restore
+        // finds the FTS entry already present (matching the trigger behavior
+        // where soft delete does NOT evict the FTS entry).
+        try db.exec(
+            \\INSERT INTO l1_fts(rowid, content, scene_name)
+            \\  SELECT rowid, content, scene_name FROM l1_records
+        );
+
+        // Recreate the sync triggers (same as createSchema).
+        try db.exec(
+            \\CREATE TRIGGER l1_ai AFTER INSERT ON l1_records BEGIN
+            \\  INSERT INTO l1_fts(rowid, content, scene_name)
+            \\  VALUES (new.rowid, new.content, new.scene_name);
+            \\END
+        );
+        try db.exec(
+            \\CREATE TRIGGER l1_ad AFTER DELETE ON l1_records BEGIN
+            \\  INSERT INTO l1_fts(l1_fts, rowid, content, scene_name)
+            \\  VALUES('delete', old.rowid, old.content, old.scene_name);
+            \\END
+        );
+        // l1_au is recreated by the caller (migrateSchema) after this returns.
+    }
+
+    /// Returns true when the `l1_fts` FTS5 table already has a `scene_name`
+    /// column (i.e. the schema is current). Returns false when the table is
+    /// absent or has only the legacy `content`-only schema.
+    ///
+    /// Uses `PRAGMA table_info(l1_fts)` — for FTS5 virtual tables this reports
+    /// the user-defined columns (content, scene_name) as rows, with the column
+    /// name in position 1 (same layout as for regular tables).
+    fn ftsHasSceneNameColumn(db: *sqlite.Db) !bool {
+        var stmt = try db.prepare("PRAGMA table_info(l1_fts)");
+        defer stmt.finalize();
+        while (try stmt.step()) {
+            // Column 1 is the name (same layout as PRAGMA table_info).
+            if (std.mem.eql(u8, stmt.columnText(1), "scene_name")) return true;
         }
         return false;
     }
@@ -599,17 +765,43 @@ pub const SqliteStore = struct {
 // Helpers
 // ============================
 
+/// Returns true when `query` is empty or contains only whitespace characters.
+/// Used to short-circuit FTS5 search — an empty FTS5 MATCH phrase matches
+/// nothing, so we fall back to a full table scan (newest first) instead.
+fn isBlankQuery(query: []const u8) bool {
+    for (query) |ch| {
+        switch (ch) {
+            ' ', '\t', '\n', '\r' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Build a safe FTS5 query string from user input.
-/// Wraps each token in double quotes to prevent FTS5 syntax injection.
+///
+/// Each whitespace-delimited token is wrapped in double quotes (to prevent
+/// FTS5 syntax injection) and the tokens are joined with the FTS5 `OR`
+/// operator. OR semantics are critical for memory search usability: a
+/// multi-word natural-language query like "franky htmx implementation" should
+/// return any memory that contains *any* of those terms, not silently return
+/// zero results because no single memory happens to contain *all* of them.
+/// The AND (default) join caused widespread false-negatives — see the
+/// memory_search false-negative bug report.
+///
+/// Empty / whitespace-only queries are handled by the caller (`searchL1Fts`
+/// short-circuits via `isBlankQuery` before calling this function). The
+/// `if (first)` guard below is a defensive fallback that emits an empty
+/// phrase if this function is ever called with a blank query.
 fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    // Split on whitespace, quote each token.
+    // Split on whitespace, quote each token, join with OR.
     var it = std.mem.tokenizeAny(u8, query, " \t\n\r");
     var first = true;
     while (it.next()) |token| {
-        if (!first) try buf.append(allocator, ' ');
+        if (!first) try buf.appendSlice(allocator, " OR ");
         first = false;
         try buf.append(allocator, '"');
         // Escape internal double-quotes by doubling them (FTS5 convention).
