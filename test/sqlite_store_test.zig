@@ -1385,3 +1385,422 @@ test "MemoryContext list delegates through vtable" {
     try std.testing.expect(items[0].updated_time.len > 0);
     try std.testing.expectEqualStrings("{}", items[0].metadata_json);
 }
+
+// ============================
+// FTS scene_name + content + OR semantics (false-negative fix)
+// ============================
+
+test "FTS search finds terms in scene_name only" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    // Memory whose scene_name contains "htmx" but content does NOT.
+    const r = types.L1Record{
+        .record_id = "scene-only-001",
+        .content = "The admin interface was rewritten with a reactive framework.",
+        .type = .episodic,
+        .priority = 70,
+        .scene_name = "franky htmx implementation gotchas",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "100",
+        .updated_time = "100",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r, iso);
+
+    // "htmx" is ONLY in scene_name — before the fix this returned 0 results.
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "htmx", 10, iso);
+    defer {
+        for (results) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("scene-only-001", results[0].record_id);
+}
+
+test "FTS search multi-word OR returns results when not all terms match" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    const r = types.L1Record{
+        .record_id = "or-001",
+        .content = "The admin interface was rewritten with a reactive framework.",
+        .type = .episodic,
+        .priority = 70,
+        .scene_name = "franky htmx implementation gotchas",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "100",
+        .updated_time = "100",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r, iso);
+
+    // "reactive" is in content, "htmx" is in scene_name — before the fix
+    // (AND semantics + scene_name not indexed) this returned 0 results.
+    // With OR + scene_name indexed, at least one term matches.
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "reactive htmx", 10, iso);
+    defer {
+        for (results) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("or-001", results[0].record_id);
+}
+
+test "FTS search OR returns row matching any single word" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    const r1 = makeRecord("or-a", "User likes PostgreSQL for OLTP workloads");
+    _ = try ctx.store.upsertL1(r1, iso);
+    const r2 = makeRecord("or-b", "User prefers MySQL for simple projects");
+    _ = try ctx.store.upsertL1(r2, iso);
+
+    // With AND semantics, "PostgreSQL MySQL" would return 0 (no row has both).
+    // With OR, it should return both rows.
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "PostgreSQL MySQL", 10, iso);
+    defer {
+        for (results) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "FTS search matches same scene_name across multiple memories" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    // Two memories with the SAME scene_name but different content.
+    const r1 = types.L1Record{
+        .record_id = "dup-scene-a",
+        .content = "The proxy htmx implementation uses SSE for event routing.",
+        .type = .episodic,
+        .priority = 70,
+        .scene_name = "franky proxy htmx implementation",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "200",
+        .updated_time = "200",
+        .metadata_json = "{}",
+    };
+    const r2 = types.L1Record{
+        .record_id = "dup-scene-b",
+        .content = "The proxy htmx implementation gotchas: encodeEventHtml escaping.",
+        .type = .episodic,
+        .priority = 65,
+        .scene_name = "franky proxy htmx implementation",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "100",
+        .updated_time = "100",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r1, iso);
+    _ = try ctx.store.upsertL1(r2, iso);
+
+    // Searching for the scene name should find BOTH memories, not just one.
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "proxy htmx", 10, iso);
+    defer {
+        for (results) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "FTS search scene_name term finds memory with empty-ish content" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    // Memory where the scene_name is the primary searchable text.
+    const r = types.L1Record{
+        .record_id = "scene-primary",
+        .content = "Done.",
+        .type = .episodic,
+        .priority = 50,
+        .scene_name = "franky-box worker registration flow",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "100",
+        .updated_time = "100",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r, iso);
+
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "registration", 10, iso);
+    defer {
+        for (results) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("scene-primary", results[0].record_id);
+}
+
+test "FTS migration rebuilds index with scene_name column" {
+    // Simulate a legacy database: create the old FTS schema (content-only),
+    // insert a row, then reopen the store so migrateFtsSchema runs.
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+
+    // Drop the current FTS table + triggers and recreate the legacy schema.
+    try ctx.store.db.exec("DROP TRIGGER IF EXISTS l1_ai");
+    try ctx.store.db.exec("DROP TRIGGER IF EXISTS l1_ad");
+    try ctx.store.db.exec("DROP TRIGGER IF EXISTS l1_au");
+    try ctx.store.db.exec("DROP TABLE IF EXISTS l1_fts");
+    try ctx.store.db.exec(
+        \\CREATE VIRTUAL TABLE l1_fts USING fts5(
+        \\  content,
+        \\  content='l1_records',
+        \\  content_rowid='rowid'
+        \\)
+    );
+    // Recreate legacy triggers (content-only).
+    try ctx.store.db.exec(
+        \\CREATE TRIGGER l1_ai AFTER INSERT ON l1_records BEGIN
+        \\  INSERT INTO l1_fts(rowid, content) VALUES (new.rowid, new.content);
+        \\END
+    );
+    try ctx.store.db.exec(
+        \\CREATE TRIGGER l1_ad AFTER DELETE ON l1_records BEGIN
+        \\  INSERT INTO l1_fts(l1_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+        \\END
+    );
+
+    const iso = types.IsolationContext{ .session_id = "s1" };
+    const r = types.L1Record{
+        .record_id = "mig-001",
+        .content = "The admin interface was rewritten.",
+        .type = .episodic,
+        .priority = 70,
+        .scene_name = "franky htmx implementation",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "100",
+        .updated_time = "100",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r, iso);
+
+    // Before migration, scene_name-only search returns 0 (content doesn't have "htmx").
+    const before = try ctx.store.searchL1Hybrid(ctx.allocator, "htmx", 10, iso);
+    defer {
+        for (before) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(before);
+    }
+    try std.testing.expectEqual(@as(usize, 0), before.len);
+
+    // Close and reopen — this triggers migrateFtsSchema.
+    ctx.store.deinit();
+    ctx.store = try sqlite_store.SqliteStore.init(ctx.allocator, ctx.io, ctx.db_path);
+
+    // After migration, "htmx" (scene_name-only) should now be found.
+    const after = try ctx.store.searchL1Hybrid(ctx.allocator, "htmx", 10, iso);
+    defer {
+        for (after) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(after);
+    }
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqualStrings("mig-001", after[0].record_id);
+
+    // Verify the l1_au trigger survived migration: updating scene_name should
+    // update the FTS index. Change the scene_name to include a new term, then
+    // search for it.
+    const r_updated = types.L1Record{
+        .record_id = "mig-001",
+        .content = "The admin interface was rewritten.",
+        .type = .episodic,
+        .priority = 70,
+        .scene_name = "franky sse event routing",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "100",
+        .updated_time = "100",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r_updated, iso);
+
+    // The old scene_name term "htmx" should no longer match (upsert = delete
+    // + insert, which fires l1_ad + l1_ai, evicting the old FTS entry).
+    const after_old = try ctx.store.searchL1Hybrid(ctx.allocator, "htmx", 10, iso);
+    defer {
+        for (after_old) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(after_old);
+    }
+    try std.testing.expectEqual(@as(usize, 0), after_old.len);
+
+    // The new scene_name term "sse" should match.
+    const after_new = try ctx.store.searchL1Hybrid(ctx.allocator, "sse", 10, iso);
+    defer {
+        for (after_new) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(after_new);
+    }
+    try std.testing.expectEqual(@as(usize, 1), after_new.len);
+    try std.testing.expectEqualStrings("mig-001", after_new[0].record_id);
+
+    // Verify l1_ai works post-migration: insert a brand new row and search.
+    const r2 = types.L1Record{
+        .record_id = "mig-002",
+        .content = "Worker registration flow.",
+        .type = .episodic,
+        .priority = 60,
+        .scene_name = "franky-box worker registration",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "200",
+        .updated_time = "200",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r2, iso);
+    const after_insert = try ctx.store.searchL1Hybrid(ctx.allocator, "registration", 10, iso);
+    defer {
+        for (after_insert) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(after_insert);
+    }
+    try std.testing.expectEqual(@as(usize, 1), after_insert.len);
+    try std.testing.expectEqualStrings("mig-002", after_insert[0].record_id);
+}
+
+test "FTS search with empty scene_name still works" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    // Memory with an empty scene_name — the FTS index gets an empty string
+    // for the scene_name column. Content search should still work.
+    const r = types.L1Record{
+        .record_id = "empty-scene-001",
+        .content = "User prefers dark mode for late-night coding sessions.",
+        .type = .persona,
+        .priority = 70,
+        .scene_name = "",
+        .session_key = "sk1",
+        .session_id = "s1",
+        .team_id = "default",
+        .task_id = "",
+        .user_id = "default",
+        .agent_id = "default",
+        .version = 1,
+        .timestamp_str = "",
+        .timestamp_start = "",
+        .timestamp_end = "",
+        .created_time = "100",
+        .updated_time = "100",
+        .metadata_json = "{}",
+    };
+    _ = try ctx.store.upsertL1(r, iso);
+
+    // Content search should still find the memory.
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "dark mode", 10, iso);
+    defer {
+        for (results) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("empty-scene-001", results[0].record_id);
+}
+
+test "FTS search with empty query returns results" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    _ = try ctx.store.upsertL1(makeRecord("empty-q-001", "User likes PostgreSQL"), iso);
+    _ = try ctx.store.upsertL1(makeRecord("empty-q-002", "User likes MySQL"), iso);
+
+    // Empty query — buildFtsQuery produces "" (empty-phrase), which should
+    // match all rows (FTS5 "" is a valid query that matches everything).
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "", 10, iso);
+    defer {
+        for (results) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    // Should return all memories (both rows).
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "FTS search with whitespace-only query returns results" {
+    var ctx = try TestCtx.init();
+    defer ctx.deinit();
+    const iso = types.IsolationContext{ .session_id = "s1" };
+
+    _ = try ctx.store.upsertL1(makeRecord("ws-q-001", "User likes PostgreSQL"), iso);
+
+    // Whitespace-only query — tokenizeAny produces no tokens, so buildFtsQuery
+    // emits the empty-phrase "" which matches everything.
+    const results = try ctx.store.searchL1Hybrid(ctx.allocator, "   ", 10, iso);
+    defer {
+        for (results) |x| x.deinit(ctx.allocator);
+        ctx.allocator.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+}
